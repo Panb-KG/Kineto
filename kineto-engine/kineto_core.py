@@ -389,6 +389,49 @@ class PoseExtractor:
             "betas": betas,
         }
 
+    def compute_mesh_for_keyframes(self, keyframes: list) -> dict:
+        """对关键帧执行 SMPL forward，获取 mesh 顶点和 faces"""
+        if not self.model or not hasattr(self.model, 'smpl'):
+            return {"has_mesh": False, "mesh_vertices": [], "faces": []}
+
+        try:
+            all_vertices = []
+            faces = self.model.smpl.faces  # numpy array, shared across frames
+
+            for kf in keyframes[:4]:  # 最多 4 个关键帧
+                betas = kf.get("betas", [0] * 10)
+                smpl_thetas = kf.get("smpl_thetas", [0] * 72)
+
+                # 拆分 thetas
+                global_orient_aa = np.array(smpl_thetas[:3], dtype=np.float32)
+                body_pose_aa = np.array(smpl_thetas[3:72], dtype=np.float32)
+
+                # 轴角 → 旋转矩阵
+                global_orient_mat = Rotation.from_rotvec(global_orient_aa).as_matrix().reshape(1, 3, 3)
+                body_pose_mat = Rotation.from_rotvec(body_pose_aa.reshape(-1, 3)).as_matrix().reshape(1, 23, 3, 3)
+
+                # 转 torch
+                betas_t = torch.tensor([betas], dtype=torch.float32, device=self.device)
+                go_t = torch.tensor(global_orient_mat, dtype=torch.float32, device=self.device)
+                bp_t = torch.tensor(body_pose_mat, dtype=torch.float32, device=self.device)
+
+                # SMPL forward
+                with torch.no_grad():
+                    smpl_out = self.model.smpl(betas=betas_t, body_pose=bp_t, global_orient=go_t, pose2rot=False)
+
+                vertices = smpl_out.vertices[0].cpu().numpy()  # (6890, 3)
+                all_vertices.append(vertices.tolist())
+
+            return {
+                "has_mesh": True,
+                "mesh_vertices": all_vertices,  # 4 × 6890 × 3
+                "faces": faces.tolist(),  # 13776 × 3
+                "mesh_vertices_per_frame": 6890,
+            }
+        except Exception as exc:
+            print(f"[Mesh] ⚠️  SMPL mesh 计算失败（不影响主流程）: {exc}", file=sys.stderr)
+            return {"has_mesh": False, "mesh_vertices": [], "faces": []}
+
     def _extract_4dhumans_rotated(self, frame, person_bbox):
         """旋转欺骗：对横卧人体分别尝试 90°CCW 和 90°CW 旋转后推理，
         用多维直立质量分选出最优方向，再将 3D 结果逆旋转回原始坐标系。
@@ -1555,6 +1598,19 @@ def _process_video_impl(stack, input_path, output_dir, device,
     else:
         pose_info = {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
 
+    # ---- SMPL Mesh 计算（仅关键帧，最多 4 帧）----
+    mesh_result = extractor.compute_mesh_for_keyframes(keyframes)
+    if mesh_result["has_mesh"]:
+        print(f"[Mesh] ✓ 计算完成：{len(mesh_result['mesh_vertices'])} 帧 × "
+              f"{mesh_result['mesh_vertices_per_frame']} 顶点, "
+              f"{len(mesh_result['faces'])} 面")
+        # 将 mesh_vertices 写入各关键帧
+        for idx_kf, kf in enumerate(keyframes):
+            kf["mesh_vertices"] = (mesh_result["mesh_vertices"][idx_kf]
+                                   if idx_kf < len(mesh_result["mesh_vertices"]) else [])
+    else:
+        print("[Mesh] 无 mesh（fallback 模式或计算失败）")
+
     metadata = {
         "video_fps": round(fps, 2),
         "total_frames": total_frames,
@@ -1576,6 +1632,9 @@ def _process_video_impl(stack, input_path, output_dir, device,
         # 四宫格教学图
         "grid_images": grid_result["grid_images"],
         "grid_labels": grid_result["grid_labels"],
+        # SMPL mesh
+        "has_mesh": mesh_result["has_mesh"],
+        "mesh_vertices_per_frame": mesh_result.get("mesh_vertices_per_frame", 0),
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,
@@ -1584,7 +1643,11 @@ def _process_video_impl(stack, input_path, output_dir, device,
         },
     }
 
-    pose_data = {"metadata": metadata, "keyframes": keyframes}
+    pose_data = {
+        "metadata": metadata,
+        "keyframes": keyframes,
+        "mesh_faces": mesh_result["faces"] if mesh_result["has_mesh"] else [],
+    }
     json_path = output_path / "pose_data.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(pose_data, f, indent=2, ensure_ascii=False)
