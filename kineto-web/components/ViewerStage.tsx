@@ -10,7 +10,7 @@
 
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import MetadataPanel from "./MetadataPanel";
 import TimelineControls from "./TimelineControls";
@@ -24,9 +24,17 @@ const SkeletonViewer = dynamic(() => import("./SkeletonViewer"), {
   loading: () => <div className="viewer-skeleton-loading">初始化 3D 引擎…</div>,
 });
 
+const MeshViewer = dynamic(() => import("./MeshViewer"), {
+  ssr: false,
+  loading: () => <div className="viewer-skeleton-loading">初始化 Mesh 引擎…</div>,
+});
+
 const VideoCompare = dynamic(() => import("./VideoCompare"), {
   ssr: false,
 });
+
+/** 3D 视图渲染模式 */
+type ViewMode = "skeleton" | "mesh" | "both";
 
 interface ViewerStageProps {
   /** 可选任务 ID；缺省时离线加载内置 fixture。 */
@@ -111,6 +119,26 @@ function ReadyStage({
   const keyframes = useMemo(() => data.keyframes, [data]);
   const { timeline, playing, durationMs, toggle } = useTimeline(keyframes, true);
 
+  // 检查是否有 mesh 数据
+  const hasMesh = data.metadata.has_mesh === true && 
+    data.mesh_faces !== undefined && 
+    data.mesh_faces.length > 0 &&
+    keyframes.some((kf) => kf.mesh_vertices && kf.mesh_vertices.length > 0);
+
+  // 视图模式切换（默认骨架，有 mesh 数据时可选）
+  const [viewMode, setViewMode] = useState<ViewMode>("skeleton");
+  const [showWireframe, setShowWireframe] = useState(false);
+
+  // 切换视图模式的回调
+  const cycleViewMode = useCallback(() => {
+    if (!hasMesh) return;
+    setViewMode((prev) => {
+      if (prev === "skeleton") return "mesh";
+      if (prev === "mesh") return "both";
+      return "skeleton";
+    });
+  }, [hasMesh]);
+
   // 空格键播放/暂停
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -120,10 +148,14 @@ function ReadyStage({
         e.preventDefault();
         toggle();
       }
+      // M 键切换视图模式
+      if (e.code === "KeyM" && hasMesh) {
+        cycleViewMode();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [toggle]);
+  }, [toggle, hasMesh, cycleViewMode]);
 
   return (
     <>
@@ -162,11 +194,60 @@ function ReadyStage({
         />
       )}
 
-      {/* 下半部分：3D 骨架视图 + 控制条 + 元数据 */}
-      <section className="viewer-section" aria-label="3D 骨架交互视图">
+      {/* 下半部分：3D 视图 + 控制条 + 元数据 */}
+      <section className="viewer-section" aria-label="3D 交互视图">
         <div className="viewer-frame">
-          <SkeletonViewer keyframes={keyframes} timeline={timeline} />
-          <div className="viewer-hint">拖拽旋转 · 滚轮缩放 · 右键平移</div>
+          {/* 根据视图模式渲染 */}
+          {viewMode === "skeleton" && (
+            <SkeletonViewer keyframes={keyframes} timeline={timeline} />
+          )}
+          {viewMode === "mesh" && hasMesh && (
+            <MeshViewer
+              keyframes={keyframes}
+              faces={data.mesh_faces!}
+              timeline={timeline}
+              showWireframe={showWireframe}
+            />
+          )}
+          {viewMode === "both" && hasMesh && (
+            <div className="viewer-both-container">
+              <MeshViewer
+                keyframes={keyframes}
+                faces={data.mesh_faces!}
+                timeline={timeline}
+                showWireframe={showWireframe}
+              />
+              <div className="viewer-skeleton-overlay">
+                <SkeletonViewer keyframes={keyframes} timeline={timeline} />
+              </div>
+            </div>
+          )}
+
+          {/* 视图模式切换按钮 */}
+          {hasMesh && (
+            <div className="viewer-mode-toggle">
+              <button
+                className="viewer-mode-btn"
+                onClick={cycleViewMode}
+                title="切换视图模式 (M)"
+              >
+                {viewMode === "skeleton" && "🦴 骨架"}
+                {viewMode === "mesh" && "👤 Mesh"}
+                {viewMode === "both" && "🦴+👤 叠加"}
+              </button>
+              {(viewMode === "mesh" || viewMode === "both") && (
+                <button
+                  className="viewer-mode-btn viewer-mode-btn--sm"
+                  onClick={() => setShowWireframe((v) => !v)}
+                  title="切换线框显示"
+                >
+                  {showWireframe ? "◈ 线框" : "◇ 线框"}
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="viewer-hint">拖拽旋转 · 滚轮缩放 · 右键平移{hasMesh ? " · M 切换模式" : ""}</div>
         </div>
 
         <div className="viewer-side">

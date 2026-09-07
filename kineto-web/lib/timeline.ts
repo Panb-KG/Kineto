@@ -250,6 +250,109 @@ export function sampleJoints(
   return out;
 }
 
+/**
+ * 在给定时间采样 mesh 顶点坐标，写入 out（长度需为 vertexCount×3）。
+ * 对相邻两个关键帧做线性插值；时间越界时 clamp 到首/尾帧。
+ * 若某帧缺少 mesh_vertices，则回退到最近有数据的关键帧。
+ */
+export function sampleMeshVertices(
+  index: TimeIndex,
+  timeMs: number,
+  out: Float32Array,
+): Float32Array {
+  const { times, keyframes } = index;
+  const n = keyframes.length;
+  if (n === 0) return out;
+
+  // 找到最近有 mesh_vertices 的帧
+  const findMeshFrame = (startIdx: number, direction: 1 | -1): number => {
+    for (let i = startIdx; i >= 0 && i < n; i += direction) {
+      if (keyframes[i].mesh_vertices && keyframes[i].mesh_vertices!.length > 0) {
+        return i;
+      }
+    }
+    return -1;
+  };
+
+  if (n === 1) {
+    const idx = findMeshFrame(0, 1);
+    if (idx >= 0) {
+      const verts = keyframes[idx].mesh_vertices!;
+      for (let k = 0; k < verts.length && k * 3 + 2 < out.length; k++) {
+        out[k * 3] = verts[k][0];
+        out[k * 3 + 1] = verts[k][1];
+        out[k * 3 + 2] = verts[k][2];
+      }
+    }
+    return out;
+  }
+
+  const i = lowerIndex(times, timeMs);
+  const i2 = Math.min(i + 1, n - 1);
+
+  // 寻找相邻两帧（需要有 mesh_vertices）
+  const aIdx = findMeshFrame(i, -1) ?? findMeshFrame(i, 1);
+  const bIdx = findMeshFrame(i2, 1) ?? findMeshFrame(i2, -1);
+
+  if (aIdx < 0 || bIdx < 0) return out;
+
+  const a = keyframes[aIdx];
+  const b = keyframes[bIdx];
+  if (!a.mesh_vertices || !b.mesh_vertices) return out;
+
+  const t0 = times[aIdx];
+  const t1 = times[bIdx];
+  const span = t1 - t0;
+  const frac = span > 1e-6 ? (timeMs - t0) / span : 0;
+
+  const va = a.mesh_vertices;
+  const vb = b.mesh_vertices;
+  const count = Math.min(va.length, vb.length, out.length / 3);
+  for (let k = 0; k < count; k++) {
+    const pa = va[k];
+    const pb = vb[k];
+    out[k * 3] = pa[0] + (pb[0] - pa[0]) * frac;
+    out[k * 3 + 1] = pa[1] + (pb[1] - pa[1]) * frac;
+    out[k * 3 + 2] = pa[2] + (pb[2] - pa[2]) * frac;
+  }
+  return out;
+}
+
+/**
+ * 计算 mesh 顶点的居中/缩放变换（与 computeFraming 类似，但基于 mesh 顶点）。
+ */
+export function computeMeshFraming(
+  keyframes: Keyframe[],
+  targetSize = 2.4,
+): FrameTransform {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let hasData = false;
+
+  for (const kf of keyframes) {
+    if (!kf.mesh_vertices) continue;
+    hasData = true;
+    for (const [x, y, z] of kf.mesh_vertices) {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
+    }
+  }
+
+  if (!hasData) return { offset: [0, 0, 0], scale: 1 };
+
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6);
+  const scale = targetSize / span;
+
+  return { offset: [-cx, -cy, -cz], scale };
+}
+
 /** computeFraming 返回的帧变换（居中 + 缩放）。 */
 export interface FrameTransform {
   offset: [number, number, number];

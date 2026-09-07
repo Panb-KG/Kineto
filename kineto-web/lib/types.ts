@@ -75,6 +75,8 @@ export interface PoseMetadata {
   grid_images?: string[];
   /** 四宫格教学图标签列表（additive，旧产物可能缺失）。 */
   grid_labels?: string[];
+  /** 是否携带 SMPL mesh 数据（additive，旧产物可能缺失）。 */
+  has_mesh?: boolean;
 }
 
 /**
@@ -103,12 +105,16 @@ export interface Keyframe {
   confidence_score?: number;
   /** SMPL 体型参数 β（10 维；additive：整改后产物携带，旧样本可能缺失）。 */
   betas?: number[];
+  /** SMPL mesh 顶点坐标 6890 × [x, y, z]（additive，仅当 metadata.has_mesh 时存在）。 */
+  mesh_vertices?: Vec3[];
 }
 
 /** pose_data.json 根对象。 */
 export interface PoseData {
   metadata: PoseMetadata;
   keyframes: Keyframe[];
+  /** SMPL 三角面索引 13776 × [a, b, c]（根级别，所有帧共用；additive，旧产物可能缺失）。 */
+  mesh_faces?: Vec3[];
 }
 
 /** 关节数量常量（SMPL 标准 24 关节）。 */
@@ -119,6 +125,12 @@ export const THETAS_DIM = 72;
 
 /** SMPL 体型参数 betas 维度（additive 字段，仅用于校验/未来网格渲染）。 */
 export const BETAS_DIM = 10;
+
+/** SMPL mesh 标准顶点数。 */
+export const MESH_VERTEX_COUNT = 6890;
+
+/** SMPL mesh 标准三角面数。 */
+export const MESH_FACE_COUNT = 13776;
 
 /** 标准关节序标识值（引擎 canonical 产物应为此值）。 */
 export const JOINT_ORDER_CANONICAL = "smpl-canonical";
