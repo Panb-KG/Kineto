@@ -75,12 +75,21 @@ function SkeletonRig({
   const tmpMid = useMemo(() => new THREE.Vector3(), []);
   const UP = useMemo(() => new THREE.Vector3(0, 1, 0), []);
 
-  const { offset, scale } = framing;
+  const { offset, scale, rotation: rot } = framing;
 
   useFrame(() => {
     const ms = timeline.getMs();
     sampleJoints(timeIndex, ms, buffer.current);
     const buf = buffer.current;
+
+    // 0) 朝向校正：将 SMPL 相机空间旋转到 Y-up 场景空间
+    //    旋转在 offset/scale 之前施加，仅 9 次乘加/关节，开销可忽略
+    for (let i = 0; i < JOINT_COUNT; i++) {
+      const x = buf[i * 3], y = buf[i * 3 + 1], z = buf[i * 3 + 2];
+      buf[i * 3]     = rot[0]*x + rot[1]*y + rot[2]*z;
+      buf[i * 3 + 1] = rot[3]*x + rot[4]*y + rot[5]*z;
+      buf[i * 3 + 2] = rot[6]*x + rot[7]*y + rot[8]*z;
+    }
 
     // 1) 更新关节球位置
     for (let i = 0; i < JOINT_COUNT; i++) {
