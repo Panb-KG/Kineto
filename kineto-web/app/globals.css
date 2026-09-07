@@ -949,3 +949,56 @@ body::before {
     grid-template-columns: 1fr;
   }
 }
+
+/* 四宫格教学图 */
+.keyframe-cards {
+  margin: 1.5rem 0;
+}
+
+.keyframe-cards__grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+}
+
+@media (max-width: 768px) {
+  .keyframe-cards__grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.keyframe-cards__card {
+  position: relative;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-card, #fff);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.keyframe-cards__number {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 4px;
+  z-index: 1;
+}
+
+.keyframe-cards__image {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  display: block;
+}
+
+.keyframe-cards__label {
+  padding: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #666);
+  text-align: center;
+  border-top: 1px solid var(--border-color, #eee);
+}

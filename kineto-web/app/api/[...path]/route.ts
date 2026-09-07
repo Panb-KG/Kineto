@@ -66,9 +66,9 @@ function isAllowedRoute(method: string, path: string[]): boolean {
     if (
       p.length === 3 &&
       p[0] === "jobs" &&
-      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4")
+      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4" || /^grid_\d{2}\.jpg$/.test(p[2]))
     ) {
-      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4}
+      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4|grid_XX.jpg}
     }
   }
   return false;

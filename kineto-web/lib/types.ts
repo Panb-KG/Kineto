@@ -71,6 +71,10 @@ export interface PoseMetadata {
   schema_version?: number;
   /** 输入视频 MD5 hash，用于验证输入输出一致性（additive，旧产物可能缺失）。 */
   video_md5?: string;
+  /** 四宫格教学图文件名列表（additive，旧产物可能缺失）。 */
+  grid_images?: string[];
+  /** 四宫格教学图标签列表（additive，旧产物可能缺失）。 */
+  grid_labels?: string[];
 }
 
 /**

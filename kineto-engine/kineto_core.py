@@ -1179,6 +1179,93 @@ def classify_pose_type(joints_3d: np.ndarray) -> dict:
 
 
 # ============================================================================
+# 四宫格教学图生成
+# ============================================================================
+
+# 关键帧阶段标签（与前端 KeyframeCards 语义对齐）
+_GRID_LABELS = ["起始位 Setup", "离心 Descent", "转折点 Amortization", "向心 Ascent"]
+
+
+def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
+                          focal_length: float = 5000.0, image_size: int = 256) -> dict:
+    """生成四宫格教学图：关键帧截图 + 骨骼标注。
+
+    对最多 4 个关键帧截取视频帧并用 SkeletonRenderer 叠加 2D 骨骼投影。
+    失败不影响主流程（调用方须 try/except）。
+
+    返回 {"grid_images": [filename, ...], "grid_labels": [label, ...]}
+    """
+    labels = _GRID_LABELS
+    grid_images: list[str] = []
+    grid_labels: list[str] = []
+
+    if not keyframes:
+        return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print("[Grid] ⚠️  无法打开视频，跳过四宫格生成", file=sys.stderr)
+        return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+    try:
+        # 探测视频尺寸以初始化 SkeletonRenderer
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if w <= 0 or h <= 0:
+            print("[Grid] ⚠️  无法探测视频尺寸，跳过四宫格生成", file=sys.stderr)
+            return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+        renderer = SkeletonRenderer(w, h, focal_length=focal_length, image_size=image_size)
+
+        for idx, kf in enumerate(keyframes[:4]):
+            frame_idx = kf.get("frame_index", 0)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                print(f"[Grid] ⚠️  帧 {frame_idx} 读取失败，跳过", file=sys.stderr)
+                continue
+
+            # 获取该帧的 3D 关节和相机参数
+            joints_3d = np.array(kf["joints_3d"], dtype=np.float32)
+            cam_t = np.array(kf.get("cam_t", [0, 0, 0]), dtype=np.float32)
+            conf = float(kf.get("confidence_score", 1.0))
+
+            # 用 SkeletonRenderer 叠加骨骼（复用已有投影 + 绘制逻辑）
+            annotated = renderer.draw_skeleton(frame, joints_3d, cam_t, confidence=conf)
+
+            # 添加阶段标签（白字黑底半透明条）
+            label = labels[idx] if idx < len(labels) else f"关键帧 {idx + 1}"
+            overlay = annotated.copy()
+            cv2.rectangle(overlay, (0, 0), (w, 56), (0, 0, 0), -1)
+            annotated = cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0)
+            cv2.putText(annotated, label, (20, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
+                        cv2.LINE_AA)
+
+            # 保存 JPEG（质量 92%）
+            filename = f"grid_{idx + 1:02d}.jpg"
+            filepath = output_dir / filename
+            cv2.imwrite(str(filepath), annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+            # 检查文件大小（硬约束 200KB）
+            file_size = filepath.stat().st_size
+            if file_size > 200 * 1024:
+                # 降级质量重试
+                cv2.imwrite(str(filepath), annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                print(f"[Grid] {filename} 超 200KB ({file_size // 1024}KB)，"
+                      f"降至 Q75 ({filepath.stat().st_size // 1024}KB)")
+
+            grid_images.append(filename)
+            grid_labels.append(label)
+            print(f"[Grid] ✅ {filename}: {label} (帧 {frame_idx})")
+
+    finally:
+        cap.release()
+
+    return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+
+# ============================================================================
 # 主流程: 视频逐帧解算
 # ============================================================================
 
@@ -1451,6 +1538,16 @@ def _process_video_impl(stack, input_path, output_dir, device,
     cap2.release()
     writer.release()
 
+    # ---- 第 4 步：生成四宫格教学图（关键帧截图 + 骨骼叠加）----
+    grid_result = {"grid_images": [], "grid_labels": []}
+    try:
+        grid_result = _generate_grid_images(
+            str(input_path), keyframes, output_path,
+            focal_length=extractor.focal_length, image_size=extractor.image_size)
+        print(f"[Grid] 生成 {len(grid_result['grid_images'])} 张教学图")
+    except Exception as exc:
+        print(f"[Grid] ⚠️  四宫格生成失败（不影响主流程）: {exc}", file=sys.stderr)
+
     # 姿态分类（使用第一帧关键帧）
     if keyframes and len(keyframes) > 0:
         first_frame_joints = np.array(keyframes[0]["joints_3d"], dtype=np.float32)
@@ -1476,6 +1573,9 @@ def _process_video_impl(stack, input_path, output_dir, device,
         "pose_type": pose_info["pose_type"],
         "spine_direction": pose_info["spine_direction"],
         "pose_classification_confidence": pose_info["confidence"],
+        # 四宫格教学图
+        "grid_images": grid_result["grid_images"],
+        "grid_labels": grid_result["grid_labels"],
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,

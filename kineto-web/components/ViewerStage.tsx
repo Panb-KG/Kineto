@@ -14,6 +14,7 @@ import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import MetadataPanel from "./MetadataPanel";
 import TimelineControls from "./TimelineControls";
+import KeyframeCards from "./KeyframeCards";
 import { loadPoseData, type LoadedPoseData } from "../lib/poseData";
 import { getJob } from "../lib/api";
 import { useTimeline } from "../lib/useTimeline";
@@ -150,6 +151,15 @@ function ReadyStage({
             质量降级交付：引擎判定该任务产物质量未达标，结果仅供参考。
           </span>
         </div>
+      )}
+
+      {/* 四宫格教学图：仅当 job 完成且有 grid_images 时显示 */}
+      {source === "api" && jobId && data.metadata.grid_images && data.metadata.grid_images.length > 0 && (
+        <KeyframeCards
+          jobId={jobId}
+          gridImages={data.metadata.grid_images}
+          gridLabels={data.metadata.grid_labels}
+        />
       )}
 
       {/* 下半部分：3D 骨架视图 + 控制条 + 元数据 */}
