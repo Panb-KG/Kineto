@@ -236,6 +236,98 @@ def _rotate_quality_log_if_needed() -> None:
 
 
 # ----------------------------------------------------------------------------
+# Job 持久化：从磁盘恢复已完成 job 的注册表（引擎重启后 job 不丢失）
+# ----------------------------------------------------------------------------
+def _restore_jobs_from_disk(jobs_dir: Path) -> dict[str, dict[str, Any]]:
+    """扫描 JOBS_DIR，恢复已完成 job 的注册表项。
+
+    恢复策略：
+    - 有 pose_data.json → 已完成（done），从 metadata 重建状态
+    - 有 input.mp4 但无 pose_data.json → 中断（failed），标记失败
+    - 其他情况 → 跳过（可能是临时目录或无关文件）
+
+    恢复的 job 为只读状态，不会重新入队处理。
+    """
+    restored: dict[str, dict[str, Any]] = {}
+    if not jobs_dir.exists():
+        return restored
+
+    for job_dir in jobs_dir.iterdir():
+        if not job_dir.is_dir():
+            continue
+        # 跳过隐藏文件/锁文件等
+        if job_dir.name.startswith("."):
+            continue
+
+        job_id = job_dir.name
+        pose_data_path = job_dir / "pose_data.json"
+
+        if pose_data_path.exists():
+            # ---- 已完成 job：从 pose_data.json 重建状态 ----
+            try:
+                with open(pose_data_path, encoding="utf-8") as f:
+                    pose_data = json.load(f)
+                metadata = pose_data.get("metadata", {})
+                pipeline = metadata.get("pipeline", {})
+
+                restored[job_id] = {
+                    "id": job_id,
+                    "state": "done",
+                    "progress": 1.0,
+                    "extraction_mode": metadata.get("extraction_mode"),
+                    "quality_score": pipeline.get("final_quality_score",
+                                                   metadata.get("final_quality_score")),
+                    "total_frames": metadata.get("total_frames"),
+                    "degraded": metadata.get("degraded", False),
+                    "quality_warning": metadata.get("quality_warning", False),
+                    "video_md5": metadata.get("video_md5"),
+                    "video_path": str(job_dir / "input.mp4"),
+                    "jobdir": str(job_dir),
+                    "created_at": job_dir.stat().st_ctime,
+                    "error": None,
+                    "_restored": True,  # 标记为恢复 job，防止误操作
+                }
+            except Exception as exc:
+                logger.warning("恢复 job %s 失败: %s", job_id, exc)
+        elif (job_dir / "input.mp4").exists():
+            # ---- 中断 job：有输入但无产物，标记 failed 并清理不完整文件 ----
+            logger.warning("job %s: 检测到中断 job（有 input.mp4 无 pose_data.json），标记 failed", job_id)
+
+            # 清理不完整的 job 文件（input.mp4 等），释放磁盘空间
+            cleaned_files: list[str] = []
+            try:
+                for f in job_dir.iterdir():
+                    if f.is_file():
+                        f.unlink()
+                        cleaned_files.append(f.name)
+                # 尝试删除空目录本身
+                job_dir.rmdir()
+                logger.info("job %s: 已清理中断 job 文件: %s", job_id, ", ".join(cleaned_files) or "(空目录)")
+            except Exception as cleanup_exc:
+                logger.warning("job %s: 清理中断 job 文件部分失败: %s", job_id, cleanup_exc)
+                # 清理失败仍注册 job 为 failed（内存态占位，evict 机制会处理磁盘残留）
+
+            restored[job_id] = {
+                "id": job_id,
+                "state": "failed",
+                "progress": 0.0,
+                "extraction_mode": None,
+                "quality_score": None,
+                "total_frames": None,
+                "degraded": False,
+                "quality_warning": False,
+                "video_path": None,
+                "jobdir": str(job_dir),
+                "created_at": job_dir.stat().st_ctime if job_dir.exists() else time.time(),
+                "error": "engine restarted before job completed",
+                "_restored": True,
+                "_cleaned_files": cleaned_files,
+            }
+
+    return restored
+
+
+# ----------------------------------------------------------------------------
 # 任务状态存储（内存 dict + 磁盘 job 目录；有界 queue.Queue 防 OOM）
 # ----------------------------------------------------------------------------
 _jobs: dict[str, dict[str, Any]] = {}
@@ -524,6 +616,24 @@ def _prewarm_cv2() -> None:
 async def _lifespan(app: FastAPI):
     # [m17] 启动预热 cv2（线程池，不阻塞事件循环）；关闭时无需清理。
     await asyncio.to_thread(_prewarm_cv2)
+
+    # ---- Job 持久化恢复：从磁盘扫描已完成/中断的 job ----
+    def _do_restore() -> dict[str, dict[str, Any]]:
+        return _restore_jobs_from_disk(JOBS_DIR)
+
+    restored = await asyncio.to_thread(_do_restore)
+    if restored:
+        with _jobs_lock:
+            _jobs.update(restored)
+        done_count = sum(1 for j in restored.values() if j["state"] == "done")
+        failed_count = sum(1 for j in restored.values() if j["state"] == "failed")
+        logger.info(
+            "从磁盘恢复了 %d 个 job（done=%d, failed=%d）",
+            len(restored), done_count, failed_count,
+        )
+    else:
+        logger.info("磁盘上无可恢复的 job")
+
     yield
 
 
