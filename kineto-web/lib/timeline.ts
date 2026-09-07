@@ -20,13 +20,6 @@
 import { Easing, Group, Tween } from "@tweenjs/tween.js";
 import type { Keyframe, Vec3 } from "./types";
 
-/** 3×3 旋转矩阵（行主序）。 */
-export type Matrix3 = [
-  number, number, number,
-  number, number, number,
-  number, number, number,
-];
-
 /** 时间轴订阅者：接收当前播放时间（ms）。 */
 export type TimelineListener = (ms: number) => void;
 
@@ -257,12 +250,10 @@ export function sampleJoints(
   return out;
 }
 
-/** computeFraming 返回的帧变换（居中 + 缩放 + 朝向校正）。 */
+/** computeFraming 返回的帧变换（居中 + 缩放）。 */
 export interface FrameTransform {
   offset: [number, number, number];
   scale: number;
-  /** 朝向校正矩阵：将 spine 方向对齐 +Y 轴。 */
-  orientationRotation: Matrix3;
 }
 
 /**
@@ -274,7 +265,7 @@ export function computeFraming(
   targetSize = 2.4,
 ): FrameTransform {
   if (keyframes.length === 0) {
-    return { offset: [0, 0, 0], scale: 1, orientationRotation: identityMatrix3() };
+    return { offset: [0, 0, 0], scale: 1 };
   }
 
   let minX = Infinity, minY = Infinity, minZ = Infinity;
@@ -295,85 +286,5 @@ export function computeFraming(
   const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6);
   const scale = targetSize / span;
 
-  // 计算 spine 主方向（所有帧 pelvis→neck 的平均向量），用于朝向校正
-  const orientationRotation = computeOrientationRotation(keyframes);
-
-  return { offset: [-cx, -cy, -cz], scale, orientationRotation };
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// 朝向校正：将 spine 方向对齐到 Three.js +Y 轴
-// ───────────────────────────────────────────────────────────────────────────
-
-/** 3×3 单位矩阵。 */
-function identityMatrix3(): Matrix3 {
-  return [1, 0, 0, 0, 1, 0, 0, 0, 1];
-}
-
-/** Rodrigues 旋转公式：给定单位旋转轴和角度，返回 3×3 旋转矩阵。 */
-function rodriguesRotation(axis: Vec3, angle: number): Matrix3 {
-  const [x, y, z] = axis;
-  const c = Math.cos(angle);
-  const s = Math.sin(angle);
-  const t = 1 - c;
-  return [
-    t * x * x + c,     t * x * y - s * z, t * x * z + s * y,
-    t * x * y + s * z, t * y * y + c,     t * y * z - s * x,
-    t * x * z - s * y, t * y * z + s * x, t * z * z + c,
-  ];
-}
-
-/**
- * 根据所有关键帧的 spine 方向（pelvis→neck）计算朝向校正旋转矩阵。
- * 目标：将 spine 主方向旋转到 +Y 轴 [0, 1, 0]，使骨架在 Three.js Y-up 世界中直立显示。
- *
- * - 站立/坐姿（spine ≈ +Y）：返回单位矩阵，不影响现有行为
- * - 仰卧/跪姿（spine ≈ X 轴）：绕 Z 轴旋转 ±90°
- * - spine ≈ -Y：绕 X 轴旋转 180°
- */
-function computeOrientationRotation(keyframes: Keyframe[]): Matrix3 {
-  // 收集所有帧的 spine 向量并求平均，得到主方向
-  let sx = 0, sy = 0, sz = 0;
-  let count = 0;
-  for (const kf of keyframes) {
-    const j = kf.joints_3d;
-    if (j.length < 13) continue;
-    const pelvis = j[0];
-    const neck = j[12];
-    sx += neck[0] - pelvis[0];
-    sy += neck[1] - pelvis[1];
-    sz += neck[2] - pelvis[2];
-    count++;
-  }
-  if (count === 0) return identityMatrix3();
-
-  // 归一化
-  const len = Math.sqrt(sx * sx + sy * sy + sz * sz);
-  if (len < 1e-6) return identityMatrix3();
-  sx /= len;
-  sy /= len;
-  sz /= len;
-
-  const target: Vec3 = [0, 1, 0];
-  const dot = sx * target[0] + sy * target[1] + sz * target[2];
-
-  // spine 已经接近 +Y，无需旋转
-  if (dot > 0.95) return identityMatrix3();
-
-  // 计算旋转轴（spineDir × target）
-  const axisX = sy * target[2] - sz * target[1];
-  const axisY = sz * target[0] - sx * target[2];
-  const axisZ = sx * target[1] - sy * target[0];
-  const axisLen = Math.sqrt(axisX * axisX + axisY * axisY + axisZ * axisZ);
-
-  if (axisLen < 1e-6) {
-    // spine 与 +Y 平行但方向相反（dot ≈ -1），绕 X 轴旋转 180°
-    return [1, 0, 0, 0, -1, 0, 0, 0, -1];
-  }
-
-  // 归一化旋转轴
-  const axis: Vec3 = [axisX / axisLen, axisY / axisLen, axisZ / axisLen];
-  const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
-
-  return rodriguesRotation(axis, angle);
+  return { offset: [-cx, -cy, -cz], scale };
 }

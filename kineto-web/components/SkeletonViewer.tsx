@@ -22,7 +22,7 @@ import { useMemo, useRef } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { Grid, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import type { Matrix3, PoseTimeline } from "../lib/timeline";
+import type { PoseTimeline } from "../lib/timeline";
 import {
   buildTimeIndex,
   computeFraming,
@@ -75,40 +75,21 @@ function SkeletonRig({
   const tmpMid = useMemo(() => new THREE.Vector3(), []);
   const UP = useMemo(() => new THREE.Vector3(0, 1, 0), []);
 
-  const { offset, scale, orientationRotation: rot } = framing;
-
-  // 判断旋转矩阵是否为单位矩阵（快速路径跳过逐关节矩阵乘法）
-  const isIdentity =
-    rot[0] === 1 && rot[4] === 1 && rot[8] === 1 &&
-    rot[1] === 0 && rot[2] === 0 && rot[3] === 0 &&
-    rot[5] === 0 && rot[6] === 0 && rot[7] === 0;
+  const { offset, scale } = framing;
 
   useFrame(() => {
     const ms = timeline.getMs();
     sampleJoints(timeIndex, ms, buffer.current);
     const buf = buffer.current;
 
-    // 更新关节球位置
+    // 更新关节球位置（直接应用 offset + scale，无旋转）
     for (let i = 0; i < JOINT_COUNT; i++) {
       const mesh = jointRefs.current[i];
       if (!mesh) continue;
-
-      let x = buf[i * 3];
-      let y = buf[i * 3 + 1];
-      let z = buf[i * 3 + 2];
-
-      // 应用朝向校正旋转（非单位矩阵时）
-      if (!isIdentity) {
-        const rx = rot[0] * x + rot[1] * y + rot[2] * z;
-        const ry = rot[3] * x + rot[4] * y + rot[5] * z;
-        const rz = rot[6] * x + rot[7] * y + rot[8] * z;
-        x = rx; y = ry; z = rz;
-      }
-
       mesh.position.set(
-        (x + offset[0]) * scale,
-        (y + offset[1]) * scale,
-        (z + offset[2]) * scale,
+        (buf[i * 3] + offset[0]) * scale,
+        (buf[i * 3 + 1] + offset[1]) * scale,
+        (buf[i * 3 + 2] + offset[2]) * scale,
       );
     }
 
@@ -119,31 +100,17 @@ function SkeletonRig({
       if (!mesh) continue;
 
       // 关节 A
-      let ax = buf[ia * 3], ay = buf[ia * 3 + 1], az = buf[ia * 3 + 2];
-      if (!isIdentity) {
-        const rx = rot[0] * ax + rot[1] * ay + rot[2] * az;
-        const ry = rot[3] * ax + rot[4] * ay + rot[5] * az;
-        const rz = rot[6] * ax + rot[7] * ay + rot[8] * az;
-        ax = rx; ay = ry; az = rz;
-      }
       tmpA.set(
-        (ax + offset[0]) * scale,
-        (ay + offset[1]) * scale,
-        (az + offset[2]) * scale,
+        (buf[ia * 3] + offset[0]) * scale,
+        (buf[ia * 3 + 1] + offset[1]) * scale,
+        (buf[ia * 3 + 2] + offset[2]) * scale,
       );
 
       // 关节 B
-      let bx = buf[ib * 3], by = buf[ib * 3 + 1], bz = buf[ib * 3 + 2];
-      if (!isIdentity) {
-        const rx = rot[0] * bx + rot[1] * by + rot[2] * bz;
-        const ry = rot[3] * bx + rot[4] * by + rot[5] * bz;
-        const rz = rot[6] * bx + rot[7] * by + rot[8] * bz;
-        bx = rx; by = ry; bz = rz;
-      }
       tmpB.set(
-        (bx + offset[0]) * scale,
-        (by + offset[1]) * scale,
-        (bz + offset[2]) * scale,
+        (buf[ib * 3] + offset[0]) * scale,
+        (buf[ib * 3 + 1] + offset[1]) * scale,
+        (buf[ib * 3 + 2] + offset[2]) * scale,
       );
 
       tmpDir.subVectors(tmpB, tmpA);
