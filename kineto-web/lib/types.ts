@@ -61,6 +61,16 @@ export interface PoseMetadata {
   device?: string;
   extraction_mode: ExtractionMode;
   pipeline?: PipelineMeta;
+  /**
+   * 关节排列顺序标识（additive，旧产物可能缺失）。
+   * 当值不为 "smpl-canonical" 时前端应显示告警，提示该产物使用了非标准关节序，
+   * 与前端 skeleton.ts 的 canonical 镜像可能不一致。
+   */
+  joint_order?: string;
+  /** 数据契约版本号（additive，旧产物可能缺失）。 */
+  schema_version?: number;
+  /** 输入视频 MD5 hash，用于验证输入输出一致性（additive，旧产物可能缺失）。 */
+  video_md5?: string;
 }
 
 /**
@@ -105,6 +115,9 @@ export const THETAS_DIM = 72;
 
 /** SMPL 体型参数 betas 维度（additive 字段，仅用于校验/未来网格渲染）。 */
 export const BETAS_DIM = 10;
+
+/** 标准关节序标识值（引擎 canonical 产物应为此值）。 */
+export const JOINT_ORDER_CANONICAL = "smpl-canonical";
 
 /** 任务状态枚举（后端契约：GET /jobs/{id} 的 state 字段）。 */
 export type JobState = "queued" | "running" | "done" | "failed";

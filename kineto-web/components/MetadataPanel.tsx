@@ -7,6 +7,7 @@
  */
 
 import type { PoseMetadata } from "../lib/types";
+import { JOINT_ORDER_CANONICAL } from "../lib/types";
 import type { PoseDataSource } from "../lib/poseData";
 
 interface MetadataPanelProps {
@@ -27,6 +28,10 @@ export default function MetadataPanel({
 }: MetadataPanelProps) {
   const isFakeData = metadata.extraction_mode !== "4dhumans";
   const score = qualityScore(metadata);
+  // M3: joint_order 非 canonical 时显示告警
+  const jointOrderWarn =
+    metadata.joint_order !== undefined &&
+    metadata.joint_order !== JOINT_ORDER_CANONICAL;
 
   return (
     <aside className="meta-panel" aria-label="数据元信息">
@@ -47,6 +52,23 @@ export default function MetadataPanel({
             <p>
               extraction_mode = <code>{String(metadata.extraction_mode)}</code>
               ，可能为占位/模拟数据，仅供界面演示，不可用于临床判断。
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* M3: joint_order 非 canonical 序告警 */}
+      {jointOrderWarn && (
+        <div className="meta-warning" role="alert">
+          <span className="meta-warning__icon" aria-hidden>
+            ⚠
+          </span>
+          <div>
+            <strong>非标准关节序产物</strong>
+            <p>
+              joint_order = <code>{metadata.joint_order}</code>（非{" "}
+              <code>{JOINT_ORDER_CANONICAL}</code>
+              ），骨架渲染基于 canonical 序镜像，结果可能偏斜。
             </p>
           </div>
         </div>
@@ -96,6 +118,28 @@ export default function MetadataPanel({
           <dt>model_version</dt>
           <dd>{metadata.model_version ?? "—"}</dd>
         </div>
+        {metadata.joint_order !== undefined && (
+          <div className="meta-item">
+            <dt>joint_order</dt>
+            <dd className={jointOrderWarn ? "meta-flag" : undefined}>
+              {metadata.joint_order}
+            </dd>
+          </div>
+        )}
+        {metadata.schema_version !== undefined && (
+          <div className="meta-item">
+            <dt>schema_version</dt>
+            <dd>{metadata.schema_version}</dd>
+          </div>
+        )}
+        {metadata.video_md5 && (
+          <div className="meta-item meta-item--wide">
+            <dt>video_md5</dt>
+            <dd style={{ fontFamily: 'monospace', fontSize: '0.85em' }}>
+              {metadata.video_md5}
+            </dd>
+          </div>
+        )}
       </dl>
     </aside>
   );

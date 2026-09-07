@@ -7,6 +7,7 @@ Kineto Core - 视频 3D 姿态解算引擎
 import argparse
 import contextlib
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -1164,6 +1165,17 @@ def _process_video_impl(stack, input_path, output_dir, device,
 
     extractor = PoseExtractor(device)
 
+    # ---- 计算输入视频 MD5（用于前端追踪输入输出一致性）----
+    def _compute_video_md5(path: str) -> str:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1 << 20), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    video_md5 = _compute_video_md5(input_path)
+    print(f"[Video] MD5: {video_md5}")
+
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -1385,6 +1397,7 @@ def _process_video_impl(stack, input_path, output_dir, device,
         #   schema_version=2：pose_data schema 第 2 版（canonical 关节序 + 本判别位）。
         "joint_order": "smpl-canonical",
         "schema_version": 2,
+        "video_md5": video_md5,
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,

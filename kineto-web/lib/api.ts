@@ -120,7 +120,7 @@ export async function fetchPoseData(
   let res: Response;
   try {
     // 浏览器侧不附加任何鉴权头；X-API-Key 由服务端代理注入。
-    res = await fetch(url, { signal });
+    res = await fetch(url, { signal, cache: 'no-store' });
   } catch (err) {
     throw new ApiError(`无法连接后端: ${url}`, undefined, err);
   }
@@ -141,7 +141,7 @@ export async function getJob(
   const url = `${API_BASE}/jobs/${encodeURIComponent(jobId)}`;
   let res: Response;
   try {
-    res = await fetch(url, { signal });
+    res = await fetch(url, { signal, cache: 'no-store' });
   } catch (err) {
     throw new ApiError(`无法连接后端: ${url}`, undefined, err);
   }
