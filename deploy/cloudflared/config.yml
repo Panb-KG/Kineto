@@ -1,0 +1,46 @@
+# =============================================================================
+# Cloudflare Tunnel — 本地配置 (locally-managed tunnel)
+# -----------------------------------------------------------------------------
+# 安装位置: /etc/cloudflared/config.yml   （见同目录 README.md 的完整步骤）
+#
+# 为什么必须有隧道？
+#   Kineto Engine 的 uvicorn **只绑定 127.0.0.1:8000**（见 deploy/kineto-engine.service
+#   与 docker-compose.yml 的 "不发布端口" 约定）。设备处在客户/实验室局域网内，
+#   没有公网 IP、没有入站端口映射，而 Zeabur 上的前端是公网服务，必须由它主动
+#   调用引擎 API。Cloudflare Tunnel 由设备**出站**建立到 Cloudflare 边缘的长连接，
+#   因此：无需公网 IP、无需在路由器上做端口转发、无需在 nginx 上开反代、
+#   不额外暴露任何监听端口（8000 仍然只在回环上）。
+#
+# 需要替换的两个占位符：
+#   __TUNNEL_UUID__      ← `cloudflared tunnel create kineto-engine` 的输出
+#   __YOUR_DOMAIN__      ← 你在 Cloudflare 上托管的域名，例如 example.com
+#                          最终对外地址: https://kineto-api.example.com
+# =============================================================================
+
+# 隧道 ID（与 credentials-file 必须成对；文件由 `tunnel create` 生成）
+tunnel: __TUNNEL_UUID__
+credentials-file: /etc/cloudflared/__TUNNEL_UUID__.json
+
+ingress:
+  # ---- 规则 1: Kineto Engine API -------------------------------------------
+  # 前端 (Zeabur) → https://kineto-api.<YOUR_DOMAIN> → 设备 127.0.0.1:8000
+  - hostname: kineto-api.__YOUR_DOMAIN__
+    service: http://127.0.0.1:8000
+    originRequest:
+      # 引擎是异步 job 模型：POST /jobs 立即返回 job_id，因此常规请求都很快。
+      # 但 GET /jobs/{id}/demo_output.mp4 可能回传几十 MB，connectTimeout 放宽到 60s。
+      connectTimeout: 60s
+      # 源站是 HTTP（非 TLS），保留该项以免 cloudflared 误用 TLS 回源
+      noTLSVerify: true
+      # 其余保持默认（http2Origin=false / disableChunkedEncoding=false）：
+      # uvicorn 走 HTTP/1.1，大文件上传靠 chunked 传输，不要动。
+
+  # ---- 规则 2: 兜底（必须放在最后，否则 cloudflared 拒绝启动）---------------
+  # 未匹配的 hostname 一律 404，绝不把设备上其它服务（nginx / MoFang / SSH）漏出去
+  - service: http_status:404
+
+# -----------------------------------------------------------------------------
+# 可选：warp-routing / 其它 hostname 一律不要加。
+# 若你改用 docker compose 里的 cloudflared 服务（profile: tunnel），
+# 只需把上面 service 改成 http://engine:8000（容器网络内用服务名）。
+# -----------------------------------------------------------------------------

@@ -1,0 +1,301 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Kineto Engine — 容器化备选路径 (Intel Arc / PyTorch XPU)
+# -----------------------------------------------------------------------------
+# 构建上下文 = kineto-engine/ 目录（**不是** 仓库根，避免把 kineto-web/node_modules
+# 与 .venv 拖进上下文）：
+#
+#     docker build -f deploy/Dockerfile.engine -t kineto/engine:xpu ./kineto-engine
+#     # 或直接用 compose（推荐，见 deploy/docker-compose.yml）:
+#     cd deploy && docker compose build
+#
+# -----------------------------------------------------------------------------
+# 【基础镜像选型 —— 为什么是 ubuntu:24.04 而不是别的】
+#
+#   选定: ubuntu:24.04 (noble) + Intel 官方 GPU APT 源的用户态运行时 + Python 3.11
+#
+#   理由:
+#   1) 与宿主机一致。设备本体就是 Ubuntu，且 PyTorch XPU wheel 的官方验证平台是
+#      Ubuntu 24.04 / 26.04（22.04 未验证）。容器与宿主同发行版 = 同 glibc、
+#      同 Level Zero/NEO 用户态 ABI，避免"容器里 torch.xpu.is_available()==False"
+#      这类最难查的问题。
+#   2) Intel 官方 GPU 软件栈 APT 源 (repositories.intel.com/gpu/ubuntu) 只为
+#      Ubuntu 发布（noble/jammy）。python:3.11-slim 基于 Debian bookworm，不在
+#      Intel 源支持列表里，只能手工 dpkg -i GitHub Release 上的 compute-runtime
+#      .deb —— 版本漂移风险高、升级不可复现。
+#   3) 不用 intel/ai-stacks/* 一体化镜像：那些镜像体积 10GB+，且**已经钉死**了
+#      自己的 torch + oneAPI 版本；再 `pip install -r requirements.txt` 极易触发
+#      依赖解析器把 torch 换成 PyPI 上的 CPU 轮子，或与镜像内 IPEX 版本冲突。
+#      从 ubuntu:24.04 起手，torch XPU 版本完全由我们锁定，镜像 ~4-5GB。
+#   4) 容器只需要**用户态**（NEO OpenCL ICD + Level Zero loader/driver）；
+#      内核态驱动（i915/xe）永远在宿主机上，通过 `--device /dev/dri` 透传。
+#      Intel GPU **不使用** `--gpus` / nvidia-container-runtime（那是 NVIDIA 专用）。
+#
+#   Plan B: 若设备无法访问 ppa.launchpadcontent.net / repositories.intel.com，
+#   可把 BASE_IMAGE 换成 Intel AI Stacks 的 base 镜像（自带 Python 3.11 + GPU
+#   用户态），此时跳过下面 §2/§3 两个 RUN：
+#       docker build --build-arg BASE_IMAGE=intel/ai-stacks/base-runtime:<tag> ...
+# =============================================================================
+
+ARG BASE_IMAGE=ubuntu:24.04
+FROM ${BASE_IMAGE}
+
+# Intel GPU 软件栈对应的 Ubuntu 代号（noble=24.04, jammy=22.04）
+ARG INTEL_GPU_SUITE=noble
+# 4D-Humans 上游仓库（仅在构建上下文缺少 4D-Humans/ 时才会用到，见 §6）
+ARG HMR2_REPO=https://github.com/shubham-goel/4D-Humans.git
+ARG HMR2_REF=main
+# Python 版本：requirements.txt 头部注明 3.11 兼容性最佳（3.12+ 有坑）
+ARG PYTHON_VERSION=3.11
+# 置 1 则额外安装 Intel Extension for PyTorch（kineto_core.detect_device() 会尝试
+# import 它以注册/优化 xpu 后端；torch>=2.5 已原生支持 XPU，故此项为可选增强）
+ARG INSTALL_IPEX=0
+ARG IPEX_VERSION=2.7.10+xpu
+ARG IPEX_INDEX=https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+# torch XPU 轮子索引
+ARG TORCH_XPU_INDEX=https://download.pytorch.org/whl/xpu
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+LABEL org.opencontainers.image.title="kineto-engine-xpu" \
+      org.opencontainers.image.description="Kineto Engine (4DHumans video->3D pose) FastAPI service for Intel Arc / PyTorch XPU" \
+      org.opencontainers.image.source="https://github.com/Panb-KG/Kineto"
+
+# -----------------------------------------------------------------------------
+# §1 系统依赖
+#   libgl1 / libglib2.0-0 / libsm1 / libxext6 / libxrender1 : opencv-python + pyrender 运行期
+#   libosmesa6                                              : PYOPENGL_PLATFORM=osmesa 无头软件光栅
+#   ffmpeg                                                  : 视频解码/合成 demo_output.mp4
+#   git / build-essential                                   : pip 安装 git 依赖(chumpy)与偶发 sdist 编译
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget gnupg git ssh \
+        build-essential pkg-config \
+        libgl1 libglib2.0-0 libsm1 libxext6 libxrender1 libosmesa6 \
+        libgomp1 xz-utils \
+        ffmpeg \
+        rsync; \
+    rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# §2 Python 3.11（优先发行版源；缺失则回退 deadsnakes PPA）+ 项目 venv
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    if ! apt-get install -y --no-install-recommends \
+            python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev; then \
+        echo "[base] 发行版源没有 python${PYTHON_VERSION}，回退 deadsnakes PPA"; \
+        apt-get install -y --no-install-recommends software-properties-common; \
+        add-apt-repository -y ppa:deadsnakes/ppa; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev; \
+    fi; \
+    python${PYTHON_VERSION} -m venv /opt/kineto/venv; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/opt/kineto/venv/bin:${PATH}" \
+    VIRTUAL_ENV=/opt/kineto/venv
+
+# -----------------------------------------------------------------------------
+# §3 Intel GPU 用户态运行时（NEO OpenCL ICD + Level Zero）
+#     内核态驱动在宿主机；容器内只需这些用户态库即可通过 /dev/dri 使用 GPU。
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    wget -qO- https://repositories.intel.com/gpu/intel-graphics.key \
+      | gpg --dearmor --yes --output /usr/share/keyrings/intel-graphics.gpg; \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu ${INTEL_GPU_SUITE} unified" \
+      > /etc/apt/sources.list.d/intel-gpu.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        intel-opencl-icd intel-level-zero-gpu level-zero libze1; \
+    # 可选组件：不同 suite 的包名可能不同，缺失不影响主链路
+    apt-get install -y --no-install-recommends libze-intel-gpu1 || true; \
+    apt-get install -y --no-install-recommends clinfo || true; \
+    rm -rf /var/lib/apt/lists/*; \
+    ls -l /etc/OpenCL/vendors/ 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# §4 PyTorch XPU —— **必须第一个装**
+#     requirements.txt 里的 `torch>=2.0.0` 会被已装好的 XPU 轮子满足，从而不会被
+#     覆盖成 PyPI 的 CPU 轮子；即便如此 §6 仍会做一次强校验与自动修复。
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    pip install --upgrade pip wheel setuptools; \
+    pip install torch torchvision torchaudio --index-url ${TORCH_XPU_INDEX}; \
+    python -c "import torch; print('[torch]', torch.__version__, '| xpu attr:', hasattr(torch, 'xpu'))"
+
+# 可选：Intel Extension for PyTorch（ARG INSTALL_IPEX=1 开启）
+RUN set -eux; \
+    if [ "${INSTALL_IPEX}" = "1" ]; then \
+        pip install "intel-extension-for-pytorch==${IPEX_VERSION}" --extra-index-url ${IPEX_INDEX}; \
+        python -c "import intel_extension_for_pytorch as i; print('[ipex]', i.__version__)"; \
+    else \
+        echo "[ipex] 跳过（torch>=2.5 原生支持 XPU；如需算子优化再 --build-arg INSTALL_IPEX=1）"; \
+    fi
+
+# -----------------------------------------------------------------------------
+# §5 项目依赖
+# -----------------------------------------------------------------------------
+COPY requirements.txt /tmp/requirements.txt
+RUN set -eux; \
+    pip install -r /tmp/requirements.txt
+
+# -----------------------------------------------------------------------------
+# §6 引擎代码 + 4D-Humans
+#     ⚠️ 不安装 detectron2 的 '[all]' extra：Kineto 用 YOLOv8n 做人体检测，
+#        ViTDet/detectron2 既不需要又会在 XPU 上编译失败（无 CUDA 工具链）。
+#     ⚠️ 4D-Humans 在仓库 .gitignore 中被排除，因此构建上下文里可能有、也可能没有：
+#          - 有  → 直接用（本地这份含 torch>=2.6 的【两处】补丁：模块级 torch.load→weights_only=False
+#                  monkey-patch + load 前 add_safe_globals(DictConfig,ListConfig)；
+#                  上游原版在新 torch 上加载 .ckpt 会报 UnpicklingError）
+#          - 没有 → 从上游 clone，然后 **git apply 该补丁（2 个 hunk）**（下面这一步），
+#                  否则 torch>=2.6 加载 .ckpt 必崩，而 `import hmr2` 自检发现不了。
+#     ★ 补丁的权威副本是 deploy/patches/hmr2_weights_only.patch（2 hunk）；但本镜像的构建上下文
+#       是 kineto-engine/（够不到 deploy/），所以下面用 BuildKit heredoc 内联**同一份**补丁。
+#       两者必须逐字节保持同步 —— 改了 deploy/patches/ 就要同步改这里。
+# -----------------------------------------------------------------------------
+COPY . /app/kineto-engine/
+
+# 内联 weights_only 补丁（== deploy/patches/hmr2_weights_only.patch）
+RUN <<'PATCH' cat > /tmp/hmr2_weights_only.patch
+--- a/hmr2/models/__init__.py
++++ b/hmr2/models/__init__.py
+@@ -5,7 +5,15 @@
+ from ..utils.download import cache_url
+ from ..configs import CACHE_DIR_4DHUMANS
+ 
++# Fix for PyTorch 2.6+ weights_only default change
++import torch
++_original_torch_load = torch.load
++def _patched_torch_load(*args, **kwargs):
++    kwargs['weights_only'] = False
++    return _original_torch_load(*args, **kwargs)
++torch.load = _patched_torch_load
+ 
++
+ def download_models(folder=CACHE_DIR_4DHUMANS):
+     """Download checkpoints and files for running inference.
+     """
+@@ -81,5 +89,13 @@
+     # Ensure SMPL model exists
+     check_smpl_exists()
+ 
++    # Fix for PyTorch 2.6+ weights_only default change
++    import torch
++    try:
++        from omegaconf import DictConfig, ListConfig
++        torch.serialization.add_safe_globals([DictConfig, ListConfig])
++    except ImportError:
++        pass
++
+     model = HMR2.load_from_checkpoint(checkpoint_path, strict=False, cfg=model_cfg)
+     return model, model_cfg
+PATCH
+
+RUN set -eux; \
+    cd /app/kineto-engine; \
+    if [ ! -f 4D-Humans/hmr2/models/hmr2.py ]; then \
+        echo "[build] 上下文缺少 4D-Humans/ → 从上游 clone ${HMR2_REPO}@${HMR2_REF}"; \
+        git clone --depth 1 --branch "${HMR2_REF}" "${HMR2_REPO}" 4D-Humans; \
+        echo "[build] 应用 weights_only 补丁（上游原版在 torch>=2.6 加载 .ckpt 会 UnpicklingError）"; \
+        ( cd 4D-Humans && git apply -p1 --verbose /tmp/hmr2_weights_only.patch ); \
+    else \
+        echo "[build] 使用随代码同步进来的 4D-Humans/（已验证版本，含 weights_only 补丁）"; \
+        rm -rf 4D-Humans/.git 4D-Humans/**/__pycache__ 2>/dev/null || true; \
+    fi; \
+    pip install -e ./4D-Humans; \
+    python -c "import hmr2; print('[hmr2] import OK')"
+
+# -----------------------------------------------------------------------------
+# §6b 构建期断言：hmr2.models 必须真的带【两处】补丁（weights_only monkey-patch + add_safe_globals），
+#     否则**禁止出图**。用 find_spec 定位源码后直接读文件（不在构建期执行 hmr2.models 的重型 import），
+#     等价于 inspect.getsource(hmr2.models) 含 'weights_only' 与 'add_safe_globals' 的检查。
+# -----------------------------------------------------------------------------
+RUN <<'PY' python -
+import importlib.util
+spec = importlib.util.find_spec("hmr2.models")
+assert spec is not None and spec.origin, "找不到 hmr2.models —— 4D-Humans 未正确安装"
+src = open(spec.origin, encoding="utf-8").read()
+assert "weights_only" in src, (
+    "hmr2.models 缺少 weights_only=False 补丁：torch>=2.6 加载 .ckpt 会 UnpicklingError。"
+    "拒绝构建出图。请确认 deploy/patches/hmr2_weights_only.patch（及本文件内联副本）已被 git apply。"
+)
+assert "add_safe_globals" in src, (
+    "hmr2.models 缺少 add_safe_globals(DictConfig,ListConfig) 补丁（omegaconf 安全反序列化）："
+    "说明补丁只应用了一半（2 hunk 中的第 2 个缺失）。拒绝出图。请确认权威/内联补丁两个 hunk 都已 git apply。"
+)
+print("[assert] weights_only + add_safe_globals 两处补丁均存在于 hmr2.models —— OK")
+PY
+
+# -----------------------------------------------------------------------------
+# §7 torch 仍是 XPU 版本？（防 requirements.txt 覆盖）—— 幂等自愈
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    if ! python -c "import torch,sys; v=torch.__version__; sys.exit(0 if ('+xpu' in v or getattr(torch.version,'xpu',None)) else 1)"; then \
+        echo "[fix] torch 被依赖解析换成了非 XPU 版本，强制回装 XPU 轮子"; \
+        pip install --force-reinstall --no-deps torch torchvision torchaudio --index-url ${TORCH_XPU_INDEX}; \
+    fi; \
+    python -c "import torch; print('[torch final]', torch.__version__)"
+
+# -----------------------------------------------------------------------------
+# §8 运行时配置
+#   HOME=/root              → 4DHumans 缓存解析为 /root/.cache/4DHumans
+#                             (compose 把 /srv/kineto/models 挂到 /root/.cache)
+#   KINETO_JOBS_DIR=/jobs   → 产物落到挂载卷，容器重建不丢
+#   WorkingDirectory        → kineto_core.py 用相对路径(yolov8n.pt / data/)，必须是引擎目录
+# -----------------------------------------------------------------------------
+WORKDIR /app/kineto-engine
+
+ENV HOME=/root \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    PYOPENGL_PLATFORM=osmesa \
+    KINETO_JOBS_DIR=/jobs \
+    KINETO_STRICT=1 \
+    KINETO_QUALITY_GATE=warn \
+    KINETO_QUALITY_THRESHOLD=0.6 \
+    KINETO_API_KEY="" \
+    KINETO_CORS_ORIGINS=""
+
+# ⚠️ 密钥**故意不烘进镜像**（镜像会被 push/缓存/共享，ENV 里的值 `docker inspect` 就能看到）。
+#    两个变量由 compose 注入：docker-compose.yml 里用了 `${KINETO_API_KEY:?}` / `${KINETO_CORS_ORIGINS:?}`
+#    强校验，缺值时 compose 直接报错而不启动，因此不会默默带着空密钥上线。
+#    注意 api.py 现为 fail-closed：KINETO_API_KEY 未设且未设 KINETO_ALLOW_NO_AUTH=1 → 受保护端点直接
+#    返回 503（不再 WARN+放行）；公开存活探针 /healthz 不受影响。
+#
+#    KINETO_STRICT=1 已烘进镜像（生产必开）：
+#      ● 只守"假数据/缺权重/detector 降级"的 fail-fast（退出码 3 = StrictModeRefused）
+#      ● ❗ STRICT **不再对质量做门禁**——质量由 KINETO_QUALITY_GATE 独立控制
+#    KINETO_QUALITY_GATE=warn（默认安全）：质量不达标时 job 仍 done 但附 degraded/quality_warning；
+#      设为 fail 才在不达标时判 failed；off = 从不门禁。
+#    KINETO_QUALITY_THRESHOLD=0.6：质量分阈值（与 --quality-thresh CLI 参数同源）。
+#    性能/缓存/天花板类 env（KINETO_AUDIT_VISUALIZE / KINETO_AUDIT_CACHE_FRAMES /
+#    KINETO_CLEAR_MEM_EVERY / KINETO_SUPPORTED_FRAME_CEILING / KINETO_QUALITY_LOG_MAX_BYTES /
+#    KINETO_TIMEOUT_*）**不烘进镜像**——走引擎内置默认，由 compose 或 EnvironmentFile 按需覆盖。
+
+# 仅作文档用途：compose **不发布** 任何端口（只有 expose），公网入口由 Cloudflare Tunnel 承担
+EXPOSE 8000
+
+# ★ HEALTHCHECK 必须打**公开**存活探针 /healthz，不能打需鉴权的 /health：
+#   compose 强制注入 KINETO_API_KEY → /health 无 X-API-Key 恒 401 → 容器永久 unhealthy →
+#   cloudflared 的 depends_on: engine: condition: service_healthy 永不满足 → 隧道永不启动。
+HEALTHCHECK --interval=60s --timeout=10s --start-period=300s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/healthz || exit 1
+
+# 注意：以 root 运行（GPU 设备节点 + /root/.cache 挂载约定）。
+# 该容器不发布端口、只跑在 LAN 内、且 API 由 X-API-Key 保护。
+#
+# ★ 为什么这里绑 0.0.0.0 而不是 systemd 路径那样的 127.0.0.1：
+#   容器的 127.0.0.1 是**容器自己的**回环，宿主与同网络其它容器都连不上。
+#   若绑 127.0.0.1，`http://engine:8000`（cloudflared 容器）与 `ports: ["127.0.0.1:8000:8000"]`
+#   （宿主回环映射）**都会 connection refused**。
+#   安全性不靠容器内的 bind 地址，而靠“compose 不发布端口”：未发布的端口在 LAN 上不可达，
+#   只有同一个 docker 网络（kineto）里的容器能访问。
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

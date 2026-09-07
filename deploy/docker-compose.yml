@@ -1,0 +1,192 @@
+# =============================================================================
+# Kineto Engine — 容器化备选路径 (Intel Arc / PyTorch XPU)
+# -----------------------------------------------------------------------------
+# 用法（在设备上）:
+#     cd /opt/kineto/deploy
+#     cp .env.example .env && nano .env          # 填 KINETO_API_KEY / KINETO_CORS_ORIGINS
+#     docker compose build                       # 约 15-30 min（首次）
+#     docker compose up -d engine
+#     docker compose logs -f engine
+#
+# 与 systemd 主路径 (deploy/kineto-engine.service) **二选一**，不要同时跑：
+# 两者都想占 8000，同时启动会端口冲突。切换前：
+#     sudo systemctl disable --now kineto-engine     # 停 systemd 版
+#     docker compose down                            # 停容器版
+#
+# ⚠️ Intel GPU 直通用 `devices: ["/dev/dri"]`，**不是** `--gpus` / nvidia runtime。
+# ⚠️ 不发布任何端口（只有 expose）：容器内的 uvicorn 绑 0.0.0.0，但未被 docker 映射到宿主，
+#    所以在 LAN 上不可达；公网入口完全由 Cloudflare Tunnel 承担。
+# =============================================================================
+
+name: kineto
+
+services:
+  # ---------------------------------------------------------------------------
+  # 主服务：FastAPI 引擎（串行 job 队列，并发恒为 1）
+  # ---------------------------------------------------------------------------
+  engine:
+    image: kineto/engine:xpu
+    container_name: kineto-engine
+    build:
+      # 构建上下文 = kineto-engine/（不含仓库根，避免拖入 kineto-web/node_modules、.venv）
+      context: ../kineto-engine
+      dockerfile: ../deploy/Dockerfile.engine
+      args:
+        # 下面四项可用 deploy/.env 覆盖（写法为 ${VAR:-默认值}），不想用 .env 也可直接改这里
+        BASE_IMAGE: "${BASE_IMAGE:-ubuntu:24.04}"
+        INTEL_GPU_SUITE: "${INTEL_GPU_SUITE:-noble}"   # 宿主是 22.04 时改 jammy（但 XPU wheel 未验证）
+        PYTHON_VERSION: "${PYTHON_VERSION:-3.11}"
+        HMR2_REF: "${HMR2_REF:-main}"
+        INSTALL_IPEX: "${INSTALL_IPEX:-0}"             # 置 "1" 装 intel-extension-for-pytorch==2.7.10+xpu
+    restart: unless-stopped
+
+    # --- GPU：字符设备透传（Intel 专用写法）----------------------------------
+    devices:
+      - /dev/dri
+    # 若宿主机 /dev/dri/renderD128 属组为 render(video)，root 容器无需 group_add；
+    # 如后续改成非 root 运行，取消下面两行注释：
+    #group_add:
+    #  - render
+    #  - video
+
+    # --- 存储 ----------------------------------------------------------------
+    # /srv/kineto/models 挂到 /root/.cache → 容器内 4DHumans 缓存 =
+    #   $HOME/.cache/4DHumans = /root/.cache/4DHumans = /srv/kineto/models/4DHumans
+    # 与 systemd 路径共用同一份模型（那边靠 /srv/kineto/.cache/4DHumans 软链）。
+    volumes:
+      - /srv/kineto/models:/root/.cache
+      - /srv/kineto/jobs:/jobs
+
+    working_dir: /app/kineto-engine
+
+    environment:
+      HOME: /root
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      PYOPENGL_PLATFORM: osmesa
+      KINETO_JOBS_DIR: /jobs
+      # ---------------------------------------------------------------------
+      # 生产严格模式（默认 1）：★ 语义已收敛（引擎 P3/改动 F），只守“假数据”fail-fast：
+      #   缺权重 / 回退合成关键点 / detector 静默降级 → 抛 StrictModeRefused、退出码 3、job 判 failed。
+      #   ❗ STRICT **不再对质量做门禁**（已与质量彻底解耦）：烘入 STRICT=1 仍安全，
+      #     但它绝不会因“质量分低 / verdict=warn|fail”而让 job 失败 —— 那是下面
+      #     KINETO_QUALITY_GATE 的职责（默认 warn，不会出现 done→failed 大面积回归）。
+      #   可用 deploy/.env 的 KINETO_STRICT 覆盖（仅本机调试才置 0，生产禁止）。
+      # ---------------------------------------------------------------------
+      KINETO_STRICT: "${KINETO_STRICT:-1}"
+      # ---------------------------------------------------------------------
+      # 质量门禁（与 STRICT 解耦）：off|warn|fail，**默认 warn = 安全默认**
+      #   warn → 不达标仍 done，但附 degraded/quality_warning（显式暴露，不静默、不 mass-fail）
+      #   fail → 不达标才 failed（failed 分支不带 quality_score，守前端 JobStatus 契约）
+      #   off  → 从不门禁
+      # 注：api.py 自身也默认 warn（双保险）—— 即便这里漏配也不会因 STRICT=1 而大面积失败。
+      # ---------------------------------------------------------------------
+      KINETO_QUALITY_GATE: "${KINETO_QUALITY_GATE:-warn}"
+      # 质量分辅助阈值（主信号是 audit_results.json 的 verdict）。默认与引擎内置默认一致(0.6)；
+      # deploy/validate.sh 的 G6 也读同一个变量当验收阈值。
+      KINETO_QUALITY_THRESHOLD: "${KINETO_QUALITY_THRESHOLD:-0.6}"
+      # ---------------------------------------------------------------------
+      # 性能 / 缓存 / 长视频天花板（引擎 P4/改动 G）。下面的默认值**逐项等于引擎内置默认**，
+      # 即“不配也一样”；写出来只是为了能从 deploy/.env 直接调（compose 的 .env 只做变量插值，
+      # 不在 environment: 里引用的变量不会进容器）。⚠️ 改引擎默认时务必同步这里与 .env.example。
+      # 这些开关均**不改计算结果**（joints/thetas/score 逐位一致），只影响 IO/显存/超时/告警。
+      # ---------------------------------------------------------------------
+      KINETO_AUDIT_VISUALIZE: "${KINETO_AUDIT_VISUALIZE:-1}"            # 审计问题帧 jpg；0 关闭（不改 score/verdict）
+      KINETO_AUDIT_CACHE_FRAMES: "${KINETO_AUDIT_CACHE_FRAMES:-48}"     # 采样帧有界 FIFO 缓存；<=0 禁用复用
+      KINETO_CLEAR_MEM_EVERY: "${KINETO_CLEAR_MEM_EVERY:-30}"           # 每 N 帧 empty_cache（原逐帧）；=1 恢复原行为
+      KINETO_SUPPORTED_FRAME_CEILING: "${KINETO_SUPPORTED_FRAME_CEILING:-9000}"  # 架构级帧数上限声明（超限响亮告警，不阻断）
+      # ⚠️ 不要传空值：引擎对空值回退到 0（=关闭轮转），与默认 5MB 不同
+      KINETO_QUALITY_LOG_MAX_BYTES: "${KINETO_QUALITY_LOG_MAX_BYTES:-5242880}"   # quality_log.jsonl 轮转上限(5MB)
+      # 子进程超时 = clamp(BASE + 帧数×PER_FRAME, FLOOR, MAX)；短视频命中 FLOOR（与旧版 7200s 逐位一致）
+      KINETO_TIMEOUT_FLOOR_SEC: "${KINETO_TIMEOUT_FLOOR_SEC:-7200}"
+      KINETO_TIMEOUT_BASE_SEC: "${KINETO_TIMEOUT_BASE_SEC:-1800}"
+      KINETO_TIMEOUT_PER_FRAME_SEC: "${KINETO_TIMEOUT_PER_FRAME_SEC:-0.8}"
+      KINETO_TIMEOUT_MAX_SEC: "${KINETO_TIMEOUT_MAX_SEC:-21600}"
+      # 必填：与 systemd 路径共用同一把 key（前端 X-API-Key 一致）
+      KINETO_API_KEY: ${KINETO_API_KEY:?请在 deploy/.env 中设置 KINETO_API_KEY}
+      # 必填：Zeabur 前端源，逗号分隔可多个
+      KINETO_CORS_ORIGINS: ${KINETO_CORS_ORIGINS:?请设置 KINETO_CORS_ORIGINS，例如 https://kineto-web.zeabur.app}
+      # 可选：多 GPU 时锁定设备
+      #ONEAPI_DEVICE_SELECTOR: level_zero:0
+    env_file:
+      # 不存在也不报错（compose 会忽略缺失文件需要 path: + required: false 语法，
+      # 老版本 compose 直接报错时请注释掉本段）
+      - path: /etc/kineto/kineto-engine.env
+        required: false
+
+    # --- 资源护栏（与 systemd MemoryMax=12G 对齐）---------------------------
+    mem_limit: 12g
+    memswap_limit: 12g
+    shm_size: 1gb
+    cpus: "6"
+    deploy:
+      resources:
+        limits:
+          memory: 12g
+
+    # --- 端口：**故意不发布** ------------------------------------------------
+    # 公网链路: Zeabur 前端 → Cloudflare Tunnel → 本容器
+    # 容器内 uvicorn 绑 0.0.0.0:8000（必需：容器的 127.0.0.1 对外不可达），
+    # 但下面只有 expose 没有 ports —— 未被映射的端口在宿主/LAN 上都访问不到，
+    # 只有同一个 docker 网络（kineto）里的容器能连，例如：
+    #   下面的 cloudflared 服务 → http://engine:8000
+    #
+    # 若你选择在**宿主机**上以 systemd 跑 cloudflared（config.yml 指向 127.0.0.1:8000），
+    # 则必须二选一：
+    #   A) 只绑宿主回环（仍不对 LAN 暴露，推荐）:
+    #        ports: ["127.0.0.1:8000:8000"]
+    #   B) 让 engine 直接用宿主网络（此时上面的 devices 仍需保留）:
+    #        network_mode: host
+    #   两者都不做的话，宿主上的 cloudflared 会连不上 → 502。
+    expose:
+      - "8000"
+
+    healthcheck:
+      # 容器内部自检：走容器自己的回环（uvicorn 绑 0.0.0.0 时回环同样可达）。
+      # ★ 必须打**公开**存活探针 /healthz，不能打需鉴权的 /health：本服务强制注入了
+      #   KINETO_API_KEY，/health 无 X-API-Key 会恒 401 → 容器永久 unhealthy →
+      #   下面 cloudflared 的 depends_on: condition: service_healthy 永不满足 → 隧道永不启动。
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  # ---------------------------------------------------------------------------
+  # 可选：把 Cloudflare Tunnel 一起容器化（默认不启动）
+  #   启动:  docker compose --profile tunnel up -d
+  #   前置:  /srv/kineto/cloudflared/{config.yml,<TUNNEL_UUID>.json} 已就位，
+  #          且 config.yml 中 ingress 的 service 改为 http://engine:8000
+  #          （容器网络里用服务名，不是 127.0.0.1）。详见 deploy/cloudflared/README.md
+  # ---------------------------------------------------------------------------
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: kineto-cloudflared
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    volumes:
+      - /srv/kineto/cloudflared:/etc/cloudflared:ro
+    depends_on:
+      engine:
+        condition: service_healthy
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  default:
+    name: kineto

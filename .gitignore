@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 第三方模型代码（含 SMPL 授权模型文件）不入库。
+# ⚠️ 设备端**不能**靠 git clone 上游获取：仓库里这份含 torch>=2.6 的
+#    torch.load(weights_only=False) 补丁，上游原版会报 UnpicklingError。
+#    同步到设备请用 DEPLOY_MOFANG.md §5.5 的 rsync 命令。
+kineto-engine/4D-Humans/
+
+# 模型权重（运行时自动下载）
+kineto-engine/yolov8n.pt
+kineto-engine/checkpoints/
+
+# 部署密钥：deploy/.env 由 deploy/.env.example 复制而来，内含 KINETO_API_KEY，绝不入库
+.env
+*.env
+!*.env.example
+
+# 视频与输出产物
+*.mp4
+videos/
+kineto-engine/output/
+kineto-engine/output_test/
+kineto-engine/output_closed/
+
+# 系统文件
+.DS_Store
+.DS_Store
+videos/
+*.lock
+.worker.lock

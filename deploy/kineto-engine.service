@@ -1,0 +1,144 @@
+# =============================================================================
+# Kineto Engine — systemd 服务单元（**主部署路径**，因为设备保留原 Ubuntu OS）
+# -----------------------------------------------------------------------------
+# 安装（在设备上执行，见 DEPLOY_MOFANG.md §5.7）:
+#     sudo install -m 0644 deploy/kineto-engine.service /etc/systemd/system/kineto-engine.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now kineto-engine.service
+#
+# ⚠️ XPU 设备访问权限（最容易踩的坑）:
+#     kineto 用户 **必须** 同时属于 `render` 与 `video` 组，否则进程打不开
+#     /dev/dri/renderD128，torch.xpu.is_available() 会静默返回 False，引擎随即
+#     回退到 CPU（甚至回退到合成关键点 → api.py 会把该 job 判为 FAILED）。
+#         sudo usermod -aG render,video kineto
+#         id kineto            # 应看到 render / video
+#         ls -l /dev/dri       # 确认 renderD128 的组是 render
+#     本 unit 另用 SupplementaryGroups=render video 兜底（组成员变更后需
+#     `systemctl daemon-reload && systemctl restart kineto-engine`）。
+#
+# ⚠️ 密钥:
+#     不要把真实 KINETO_API_KEY 提交进 git。推荐用 EnvironmentFile 注入：
+#         sudo mkdir -p /etc/kineto
+#         printf 'KINETO_API_KEY=%s\n' "$(openssl rand -hex 32)" | sudo tee /etc/kineto/kineto-engine.env
+#         sudo chmod 0640 /etc/kineto/kineto-engine.env
+#         sudo chown root:kineto /etc/kineto/kineto-engine.env
+#     Environment= 行中的 __SET_ME__ / __SET_ZEABUR_ORIGIN__ 仅作占位与文档用途；
+#     按 systemd.exec(5)，EnvironmentFile 里的同名变量会**覆盖** Environment= 的值
+#     （与两者在文件中的先后顺序无关），所以真实密钥只需写进 EnvironmentFile。
+#     同一个文件也是**质量门禁/性能类 env 的运维调参入口**（KINETO_QUALITY_GATE、
+#     KINETO_QUALITY_THRESHOLD、KINETO_AUDIT_* / KINETO_TIMEOUT_* 等，见下面 [Service] 段注释）。
+# =============================================================================
+
+[Unit]
+Description=Kineto Engine — 4DHumans video-to-3D-pose FastAPI service (Intel XPU)
+Documentation=file:///opt/kineto/DEPLOY_MOFANG.md
+# 网络就绪后再启动（Tunnel/前端都依赖 API 可达）
+After=network-online.target
+Wants=network-online.target
+# 启动失败限流：避免 ExecStartPre 守卫（例如密钥未注入）配合 Restart=always
+# 变成每 5s 一次、永不停止的重启循环刷 journald。60s 内失败 5 次就停在 failed 状态，
+# 便于 `systemctl status` / `journalctl -u kineto-engine` 看清楚根因。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# 专用非特权账号：HOME 指向 /srv/kineto，使 4DHumans 缓存解析为
+#   $HOME/.cache/4DHumans  ==  /srv/kineto/.cache/4DHumans  (→ 软链到 /srv/kineto/models/4DHumans)
+User=kineto
+Group=kineto
+# /dev/dri XPU 访问兜底（详见文件头注释）
+SupplementaryGroups=render video
+
+# kineto_core.py 内部使用相对路径（yolov8n.pt / data/... / output 目录），
+# api.py 也用 ENGINE_DIR 作为子进程 cwd —— 工作目录 **必须** 是引擎目录。
+WorkingDirectory=/opt/kineto/kineto-engine
+
+Environment=HOME=/srv/kineto
+Environment=OMP_NUM_THREADS=4
+Environment=MKL_NUM_THREADS=4
+# pyrender 无头渲染：走 OSMesa 软件光栅，避免 X11/EGL 依赖
+Environment=PYOPENGL_PLATFORM=osmesa
+# job 产物目录（pose_data.json / demo_output.mp4 / 日志），与 models 同盘
+Environment=KINETO_JOBS_DIR=/srv/kineto/jobs
+# 生产严格模式（★ 语义已收敛，引擎 P3/改动 F）：只守“假数据/缺权重/detector 降级”的 fail-fast
+# —— 4DHumans 权重加载失败、YOLOv8n 检测器加载失败、简化回退管线（合成关键点+全零 thetas）
+# 均抛 StrictModeRefused 并以**退出码 3** 结束（api.py 把该 job 判 failed），而非静默写假数据。
+# ❗ STRICT **不再对质量做门禁**（已与质量彻底解耦）：烘入 STRICT=1 仍安全，但它绝不会因
+#   “质量分低 / audit verdict=warn|fail”而让 job 失败 —— 那是下面 KINETO_QUALITY_GATE 的职责。
+# 本机调试若想允许回退，用 /etc/kineto/kineto-engine.env 里 KINETO_STRICT=0 覆盖（生产禁止）。
+Environment=KINETO_STRICT=1
+# 质量门禁（与 STRICT 解耦）：off|warn|fail。**默认 warn = 安全默认**：质量不达标时 job 仍
+# done，但附 degraded/quality_warning 显式暴露（不静默放行、也不会把可用结果判死）；
+# fail = 不达标才 failed（failed 分支不带 quality_score，守前端 JobStatus 契约）；off = 从不门禁。
+# api.py 自身也默认 warn（双保险）——即便本行被删也不会因 STRICT=1 而大面积失败。
+Environment=KINETO_QUALITY_GATE=warn
+# 质量分辅助阈值（主信号是 audit_iter*/audit_results.json 的 verdict）；与引擎内置默认一致(0.6)，
+# deploy/validate.sh 的 G6 也读同一变量当验收阈值。
+Environment=KINETO_QUALITY_THRESHOLD=0.6
+# ---- 可选：性能 / 缓存 / 长视频天花板（引擎 P4/改动 G）-----------------------
+# 这些开关**不改计算结果**（joints/thetas/score 逐位一致），只影响 IO/显存/超时/告警。
+# 不设（保持注释）= 走引擎内置默认，与下面注释里的值逐项相同，零风险。
+# 要调时**不必改本 unit**：直接写进 /etc/kineto/kineto-engine.env（EnvironmentFile=- 会覆盖
+# 同名 Environment= 值），然后 systemctl restart kineto-engine。取消注释也可（等效）。
+#Environment=KINETO_AUDIT_VISUALIZE=1              # 审计问题帧 jpg；0 关闭（不改 score/verdict）
+#Environment=KINETO_AUDIT_CACHE_FRAMES=48           # 采样帧有界 FIFO 缓存；<=0 禁用复用
+#Environment=KINETO_CLEAR_MEM_EVERY=30              # 每 N 帧 empty_cache（原逐帧）；=1 恢复原行为
+#Environment=KINETO_SUPPORTED_FRAME_CEILING=9000    # 架构级帧数上限声明（超限响亮告警，不阻断）
+#Environment=KINETO_QUALITY_LOG_MAX_BYTES=5242880   # quality_log.jsonl 轮转上限(5MB)；<=0 关闭轮转
+#Environment=KINETO_TIMEOUT_FLOOR_SEC=7200          # 超时 = clamp(BASE+帧数×PER_FRAME, FLOOR, MAX)
+#Environment=KINETO_TIMEOUT_BASE_SEC=1800
+#Environment=KINETO_TIMEOUT_PER_FRAME_SEC=0.8
+#Environment=KINETO_TIMEOUT_MAX_SEC=21600
+# 占位密钥 —— 请改用 /etc/kineto/kineto-engine.env 注入真实值（见文件头）
+Environment=KINETO_API_KEY=__SET_ME__
+# Zeabur 前端源（逗号分隔可多个）；未设置时 api.py 默认 https://kineto-web.zeabur.app
+Environment=KINETO_CORS_ORIGINS=__SET_ZEABUR_ORIGIN__
+# 可选：显式指定 Intel GPU 渲染节点（多 GPU 时锁定）
+#Environment=ZE_AFFINITY_MASK=0
+#Environment=ONEAPI_DEVICE_SELECTOR=level_zero:0
+# 真实密钥/CORS 覆盖文件（前缀 '-' 表示文件不存在也不报错）
+# 注意：本行会覆盖上面 Environment= 里的同名占位值
+EnvironmentFile=-/etc/kineto/kineto-engine.env
+
+# 只绑 127.0.0.1：公网入口一律经 Cloudflare Tunnel（deploy/cloudflared/）
+#
+# ★ 启动前守卫：防止带着占位密钥上线。
+#   api.py 现为 fail-closed：KINETO_API_KEY 未设且未设 KINETO_ALLOW_NO_AUTH=1 → 受保护端点直接 503（不再 WARN+放行）；
+#   而留着 __SET_ME__ 更糟 —— 它非空会被当成真密钥，鉴权“开着”但密钥是全世界都知道的占位符。
+#   下面两行会在以下任一情况下**让服务直接启动失败**（而不是默默裸奔）：
+#     · /etc/kineto/kineto-engine.env 不存在或为空
+#     · KINETO_API_KEY 缺失、短于 16 位、或仍是 __SET_ME__
+#     · KINETO_CORS_ORIGINS 不是 http(s):// 开头（例如仍是 __SET_ZEABUR_ORIGIN__）
+#   查失败原因：journalctl -u kineto-engine -n 30
+#   若你确实想暂时跳过校验（例如本机调试），把这两行注释掉即可 —— 生产环境请不要。
+#   注：命令里故意不用 $ 与 ${...}，因为 systemd 会先自己做变量展开。
+ExecStartPre=/bin/sh -c 'grep -Eq "^KINETO_API_KEY=[A-Za-z0-9+/=_.-]{16,}" /etc/kineto/kineto-engine.env'
+ExecStartPre=/bin/sh -c 'grep -Eq "^KINETO_CORS_ORIGINS=https?://" /etc/kineto/kineto-engine.env'
+
+ExecStart=/opt/kineto/venv/bin/uvicorn api:app --host 127.0.0.1 --port 8000
+
+# 引擎首次加载 ViT-H 权重(2.5GB)到显存可能较慢 → 放宽启动超时
+TimeoutStartSec=300
+Restart=always
+RestartSec=5
+
+# 资源护栏：串行推理，单进程峰值 RAM 约 6-10G；MemoryMax 依赖 cgroup v2
+MemoryMax=12G
+MemoryHigh=10G
+Nice=10
+LimitNOFILE=65536
+
+# 日志全部进 journald（journalctl -u kineto-engine -f）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kineto-engine
+
+# 温和加固：/usr /boot /etc 只读，/opt /srv 可写（pip -e 与产物都需要）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

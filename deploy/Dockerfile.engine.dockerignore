@@ -1,0 +1,61 @@
+# =============================================================================
+# BuildKit per-Dockerfile ignore 文件
+#   生效条件: 构建时 dockerfile = deploy/Dockerfile.engine
+#   BuildKit 查找顺序: <dockerfile>.dockerignore  →  <context>/.dockerignore
+#   若你的 Docker 版本过旧（< 18.09 / 未启用 BuildKit），本文件不会被读取，
+#   此时请复制为 kineto-engine/.dockerignore：
+#       cp deploy/Dockerfile.engine.dockerignore kineto-engine/.dockerignore
+#   （用 DOCKER_BUILDKIT=1 docker build ... 可强制启用 BuildKit）
+#
+# 上下文 = kineto-engine/，下面路径均相对该目录。
+# =============================================================================
+
+# --- 体积炸弹：本地 Python 虚拟环境（1.5G+），容器内会重建 -------------------
+.venv/
+venv/
+env/
+
+# --- 运行产物 / 历史输出（每个几十 MB，且与镜像无关）-------------------------
+output/
+output_test/
+output_closed/
+jobs/
+checkpoints/
+*.mp4
+*.avi
+*.mov
+
+# --- 模型权重：一律走 deploy/transfer_models.sh 同步到 /srv/kineto/models ----
+yolov8n.pt
+*.pt
+*.pth
+*.ckpt
+*.tar
+*.tar.gz
+*.pkl
+*.npz
+4D-Humans/data/
+4D-Humans/example_data/
+4D-Humans/logs*/
+4D-Humans/results/
+4D-Humans/outputs/
+4D-Humans/sandbox/
+4D-Humans/hmr2_training_data/
+4D-Humans/hmr2_evaluation_data/
+4D-Humans/hmr2.egg-info/
+
+# --- 版本控制 / 缓存 / 编辑器 -------------------------------------------------
+.git/
+.gitignore
+**/__pycache__/
+**/*.py[cod]
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+.DS_Store
+*.egg-info/
+
+# --- 文档（不影响运行；部署说明统一看仓库根 DEPLOY_MOFANG.md）-----------------
+*.md
+*.txt
+!requirements.txt

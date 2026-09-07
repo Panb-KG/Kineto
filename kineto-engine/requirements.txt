@@ -1,0 +1,96 @@
+# Kineto Engine - Video-to-Pose 核心依赖 + HTTP Task API
+# 目标环境: Python 3.11 = 设备侧目标；本机 3.13.3 已实测可用
+# 设备自适应: CUDA / Intel Arc XPU / Apple Silicon MPS / CPU（XPU 安装说明见文末）
+
+# ============================================================================
+# 深度学习推理框架
+# ----------------------------------------------------------------------------
+# 默认安装 CPU 版 torch。按目标硬件二选一（勿同时安装）：
+#   CUDA (NVIDIA / 边缘 GPU):
+#     pip install torch>=2.0.0 torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cu121
+#   CPU-only:
+#     pip install torch>=2.0.0 torchvision>=0.15.0 --index-url https://download.pytorch.org/whl/cpu
+#   Apple Silicon: 直接 pip install（默认 wheel 即含 MPS 支持）
+#   Intel Arc (XPU): 先从 XPU 专用索引安装 torch，再安装本文件其余依赖（详见文末说明）
+# ============================================================================
+torch>=2.0.0
+torchvision>=0.15.0
+
+# ============================================================================
+# 4DHumans 模型依赖（3D 姿态解算 — 推理路径）
+# ----------------------------------------------------------------------------
+# 4DHumans 本体通过 git clone + pip install -e . 安装
+# 以下与 4D-Humans/setup.py install_requires 对齐，仅保留推理必需项
+# ============================================================================
+pytorch-lightning>=2.0.0
+einops>=0.6.0
+smplx>=0.1.28
+chumpy>=0.70
+yacs>=0.1.8
+timm>=0.9.0
+pyrender>=0.1.45
+pandas>=2.0.0
+scipy>=1.11.0
+
+# ============================================================================
+# 视频处理与计算机视觉
+# ============================================================================
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# ============================================================================
+# 进度显示
+# ============================================================================
+tqdm>=4.66.0
+
+# ============================================================================
+# 人体检测 (YOLOv8n)
+# ============================================================================
+ultralytics>=8.0.0
+
+# ============================================================================
+# 可视化 UI (关键帧选择器)
+# ============================================================================
+gradio>=4.0.0
+
+# ============================================================================
+# HTTP Task API (api.py)
+# ============================================================================
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# ============================================================================
+# --- Intel Arc / IPEX (XPU) — Arc Pro B60 24GB (Battlemage)，torch>=2.5 原生支持 ---
+# requirements.txt 无法按包指定 --index-url，torch-XPU 实际安装由部署脚本/Dockerfile 执行：
+#
+# Intel Arc (XPU): install torch FIRST from the XPU index, THEN the rest of this file:
+#   pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+# Optional acceleration (IPEX):
+#   pip install intel-extension-for-pytorch==2.7.10+xpu --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+# OS caveat: official XPU wheels validated on Ubuntu 24.04/26.04; on 22.04 use the IPEX path or upgrade.
+#
+# 上方保留的 torch>=2.0.0 由 XPU 版 torch 自然满足，勿另加硬性版本钉住或取消注释 Intel 包，
+# 否则 pip 会从默认 PyPI 索引拉取 CPU 版 torch 覆盖 XPU 版。
+# ============================================================================
+
+# ============================================================================
+# [Fix #16] 可选 / 训练侧依赖（推理路径不需要，已实测缺失不影响推理）
+# ----------------------------------------------------------------------------
+# 以下包属于 4D-Humans 训练/数据集流水线，非推理路径硬依赖。
+# 已跑通的推理 venv 中验证缺失这些包不影响 kineto_core.py 正常运行。
+#
+# dill: 服务于 4D-Humans 的 torch.load(weights_only=False) 路径，
+#        加载旧版 .ckpt 时需要 dill 反序列化 lambda/闭包对象。
+#        推理环境若已应用 deploy/patches/hmr2_weights_only.patch 则不需要。
+# scikit-image: 仅用于训练数据预处理（图像增强/分割）
+# gdown: 仅用于下载 Google Drive 上的训练数据集
+# webdataset: 仅用于训练 dataloader 的 tar 流式读取
+#
+# 如需训练或数据集下载，请手动取消注释安装：
+#
+# dill>=0.3.7
+# scikit-image>=0.21.0
+# gdown>=4.7.0
+# webdataset>=0.2.0
+# ============================================================================

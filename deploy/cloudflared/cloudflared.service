@@ -1,0 +1,54 @@
+# =============================================================================
+# cloudflared — Kineto Engine 公网出口隧道 (systemd 单元)
+# -----------------------------------------------------------------------------
+# 安装（设备上执行，完整步骤见同目录 README.md）:
+#     sudo useradd --system --home /etc/cloudflared --shell /usr/sbin/nologin cloudflared   # 若 apt 未自动创建
+#     sudo install -m 0644 deploy/cloudflared/cloudflared.service /etc/systemd/system/cloudflared.service
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now cloudflared.service
+#
+# 前置:
+#   - /usr/bin/cloudflared 已由 Cloudflare 官方 apt 源安装
+#   - /etc/cloudflared/config.yml 已填好 tunnel UUID 与 hostname
+#   - /etc/cloudflared/<TUNNEL_UUID>.json 存在且 cloudflared 用户可读
+#       sudo chown -R root:cloudflared /etc/cloudflared
+#       sudo chmod 0640 /etc/cloudflared/*.json /etc/cloudflared/config.yml
+#
+# 说明:
+#   --no-autoupdate 必加：边缘设备不允许隧道进程在推理途中自我重启；
+#   版本升级由运维手动 apt upgrade + systemctl restart 完成。
+# =============================================================================
+
+[Unit]
+Description=cloudflared — Cloudflare Tunnel for Kineto Engine API
+Documentation=https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/
+After=network-online.target kineto-engine.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+# 若 journalctl 报 "Failed to notify" / 启动卡住，把 Type=notify 改成 Type=simple
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --config /etc/cloudflared/config.yml
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# 以专用非特权账号运行：它只需要读 /etc/cloudflared 与访问 127.0.0.1:8000
+User=cloudflared
+Group=cloudflared
+
+# 出站隧道，无需任何入站端口
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+# ProtectSystem=full 会把 /etc 挂为只读 —— cloudflared 只读 /etc/cloudflared，不受影响
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudflared
+
+[Install]
+WantedBy=multi-user.target
