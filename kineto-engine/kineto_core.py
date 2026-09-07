@@ -1112,6 +1112,73 @@ def compute_frame_confidence(joints_arr, frame_idx, bone_ranges=None):
 
 
 # ============================================================================
+# 姿态分类（基于 SMPL 24 关节）
+# ============================================================================
+
+def classify_pose_type(joints_3d: np.ndarray) -> dict:
+    """
+    基于 SMPL 24 关节分类姿态类型。
+
+    返回:
+    {
+        "pose_type": "standing" | "supine" | "kneeling" | "sitting" | "unknown",
+        "spine_direction": [x, y, z],  # 归一化 spine 向量
+        "confidence": float  # 分类置信度 0-1
+    }
+    """
+    # SMPL 关节索引（参考 skeleton_spec.py）
+    pelvis = joints_3d[0]
+    neck = joints_3d[12]
+    left_knee = joints_3d[4]
+    right_knee = joints_3d[5]
+
+    # 1. 计算 spine 向量
+    spine_vec = neck - pelvis
+    spine_norm = np.linalg.norm(spine_vec)
+    if spine_norm < 1e-6:
+        return {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
+
+    spine_dir = spine_vec / spine_norm
+
+    # 2. 计算特征
+    spine_y_dominance = abs(spine_dir[1]) / max(abs(spine_dir[0]), abs(spine_dir[1]), abs(spine_dir[2]), 1e-6)
+
+    # Y 轴平坦度（身体是否水平铺开）
+    y_range = joints_3d[:, 1].max() - joints_3d[:, 1].min()
+    x_range = joints_3d[:, 0].max() - joints_3d[:, 0].min()
+    z_range = joints_3d[:, 2].max() - joints_3d[:, 2].min()
+    max_range = max(x_range, y_range, z_range)
+    y_flatness = y_range / max_range if max_range > 1e-6 else 1.0
+
+    # 膝盖相对骨盆高度
+    knee_height = (left_knee[1] + right_knee[1]) / 2 - pelvis[1]
+
+    # 3. 分类逻辑
+    if spine_y_dominance > 0.7 and knee_height < -0.15:
+        pose_type = "standing"
+        confidence = min(1.0, spine_y_dominance)
+    elif spine_y_dominance < 0.2 and y_flatness < 0.5:
+        pose_type = "supine"  # 仰卧/俯卧
+        confidence = 1.0 - spine_y_dominance
+    elif spine_y_dominance > 0.5 and knee_height > -0.10:
+        # 区分 kneeling 和 sitting
+        if knee_height > 0.0:
+            pose_type = "kneeling"
+        else:
+            pose_type = "sitting"
+        confidence = spine_y_dominance
+    else:
+        pose_type = "unknown"
+        confidence = 0.5
+
+    return {
+        "pose_type": pose_type,
+        "spine_direction": spine_dir.tolist(),
+        "confidence": float(confidence)
+    }
+
+
+# ============================================================================
 # 主流程: 视频逐帧解算
 # ============================================================================
 
@@ -1384,6 +1451,13 @@ def _process_video_impl(stack, input_path, output_dir, device,
     cap2.release()
     writer.release()
 
+    # 姿态分类（使用第一帧关键帧）
+    if keyframes and len(keyframes) > 0:
+        first_frame_joints = np.array(keyframes[0]["joints_3d"], dtype=np.float32)
+        pose_info = classify_pose_type(first_frame_joints)
+    else:
+        pose_info = {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
+
     metadata = {
         "video_fps": round(fps, 2),
         "total_frames": total_frames,
@@ -1398,6 +1472,10 @@ def _process_video_impl(stack, input_path, output_dir, device,
         "joint_order": "smpl-canonical",
         "schema_version": 2,
         "video_md5": video_md5,
+        # 姿态分类结果（additive，不影响现有推理路径）
+        "pose_type": pose_info["pose_type"],
+        "spine_direction": pose_info["spine_direction"],
+        "pose_classification_confidence": pose_info["confidence"],
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,
