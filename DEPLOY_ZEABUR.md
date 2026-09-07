@@ -210,6 +210,9 @@ G11 会检查：
 - [ ] `https://<前端域名>/?job=<id>` 的来源徽标 = `LIVE API`（`api`），非 `FIXTURE`。
 - [ ] `bash deploy/validate.sh --web-base https://<前端域名>` 的 **G11 = PASS**。
 - [ ] （仅老直连路径）设备侧 `KINETO_CORS_ORIGINS` 回填了前端精确 origin；代理架构下此项**可跳过**。
+- [ ] 前端已接线 `degraded` 横幅（`UploadPanel` / `ViewerStage`）：质量降级时展示告警。
+- [ ] `PoseMetadata` 已声明 `joint_order?: string` / `schema_version?: number`（additive 可选，向后兼容）。
+- [ ] `validatePoseData` 已改为全帧校验（非只校验首帧）。
 
 ---
 

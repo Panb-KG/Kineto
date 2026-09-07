@@ -10,6 +10,7 @@
 
 import ViewerStage from "../components/ViewerStage";
 import UploadPanel from "../components/UploadPanel";
+import KeyframeCards from "../components/KeyframeCards";
 
 export const dynamic = "force-dynamic";
 
@@ -44,8 +45,10 @@ export default function Page({ searchParams }: PageProps) {
       <main>
         <UploadPanel />
 
-        <h1 className="section-label">关键帧指导图 · Guidance Frames</h1>
         <ViewerStage jobId={jobId} />
+
+        <h1 className="section-label">关键帧指导图 · Guidance Frames</h1>
+        <KeyframeCards />
       </main>
 
       <footer className="site-footer">

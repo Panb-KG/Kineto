@@ -235,6 +235,25 @@ print("[assert] weights_only + add_safe_globals 两处补丁均存在于 hmr2.mo
 PY
 
 # -----------------------------------------------------------------------------
+# §6c 构建期断言：skeleton_spec.py 必须可 import（纯拓扑常量不依赖 pkl）。
+#     pkl 在 Docker 构建期不可用（被 dockerignore 排除），但 skeleton_spec 已改为
+#     PEP 562 惰性加载：import 期只绑定拓扑常量（joint_names/parents/skeleton/bone_part_map），
+#     pkl 派生常量（BONE_LENGTH_BOUNDS/rest）在首次访问时才加载。
+#     此处断言 import 成功 + 拓扑常量可读，确保代码无语法错/依赖缺失；
+#     pkl 可用性由运行时挂载卷保证（compose /srv/kineto/models:/root/.cache）。
+#     若此处失败 → 镜像构建失败，而非运行期静默全败。
+# -----------------------------------------------------------------------------
+RUN python -c "\
+import skeleton_spec; \
+assert len(skeleton_spec.SMPL_JOINT_NAMES) == 24, 'SSOT joint_names != 24'; \
+assert len(skeleton_spec.SMPL_PARENTS) == 24, 'SSOT parents != 24'; \
+assert skeleton_spec.SMPL_PARENTS[13] == 9 and skeleton_spec.SMPL_PARENTS[14] == 9, \
+    'SSOT collar(13/14) parent != 9(spine3)'; \
+assert len(skeleton_spec.SMPL_SKELETON) == 23, 'SSOT skeleton != 23 edges'; \
+print('[assert] skeleton_spec import OK + 拓扑常量校验通过（24 joints / 23 edges / collar parent=9）'); \
+"
+
+# -----------------------------------------------------------------------------
 # §7 torch 仍是 XPU 版本？（防 requirements.txt 覆盖）—— 幂等自愈
 # -----------------------------------------------------------------------------
 RUN set -eux; \

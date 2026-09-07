@@ -26,7 +26,7 @@ import type { JobStatus, PoseData } from "./types";
  * 注意：这里【不是】引擎地址，也【不含】任何密钥——引擎地址与密钥都在服务端。
  */
 const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
-const API_BASE = (RAW_API_BASE || "/api").replace(/\/+$/, "");
+export const API_BASE = (RAW_API_BASE || "/api").replace(/\/+$/, "");
 
 // MJ2(d)：NEXT_PUBLIC_API_BASE 若为旧式绝对 URL（含 "://"），浏览器会绕过同源
 // 代理直连引擎——而引擎需要 X-API-Key（浏览器不持有），大概率 401。默认应留空走 /api。

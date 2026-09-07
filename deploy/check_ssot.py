@@ -31,7 +31,9 @@
 #   0 = 一致（PASS）
 #   1 = 检出漂移（FAIL；闸门有效，需把前端镜像对齐 SSOT）
 #   2 = 文件在但无法解析/校验（FAIL；不能证明一致就等于不安全）
-#   3 = 文件缺失，无从校验（validate.sh 记 SKIP：设备上通常没有 kineto-web/）
+#   3 = 文件缺失或环境不可用（SKIP）：
+#       - 文件缺失（设备上通常没有 kineto-web/）
+#       - pkl 不可用（Docker 构建期 / XPU 环境）→ 退化 AST 但显式 SKIP 未覆盖不变量
 # =============================================================================
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ class Report:
     def __init__(self) -> None:
         self.drifts: list[str] = []
         self.errors: list[str] = []
+        self.warnings: list[str] = []   # 非致命告警（SKIP 时展示未覆盖不变量）
 
     def ok(self, msg: str) -> None:
         print(f"{_OK} {msg}")
@@ -72,31 +75,50 @@ class Report:
         self.errors.append(msg)
         print(f"{_DRIFT} {msg}")
 
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+        print(f"{_SKIP} {msg}")
+
 
 # -----------------------------------------------------------------------------
 # SSOT 侧：kineto-engine/skeleton_spec.py
 # -----------------------------------------------------------------------------
 def load_spec_dynamic(engine_dir: Path):
-    """import skeleton_spec 取权威值（失败返回 None，由调用方退化到静态解析）。"""
+    """import skeleton_spec 取权威值。
+
+    返回 (spec_dict_or_None, how_str, pkl_available: bool)。
+    - pkl_available=True：完整 import + validate_self_consistency 通过（权威路径）。
+    - pkl_available=False：pkl 不可用（Docker 构建期 / XPU），import 本身成功但
+      validate_self_consistency 触发 FileNotFoundError；此时返回 None 让调用方
+      退化到 AST 静态解析，并标记未覆盖的 pkl 依赖不变量。
+    """
     sys.path.insert(0, str(engine_dir))
     try:
         mod = importlib.import_module("skeleton_spec")
-        problems = list(mod.validate_self_consistency())
-        if problems:                      # SSOT 自证失败 → 不能当权威值用
-            return None, f"SSOT 自检未通过: {problems}"
-        return {
-            "joint_names": list(mod.SMPL_JOINT_NAMES),
-            "parents": [int(p) for p in mod.SMPL_PARENTS],
-            "skeleton": [(int(p), int(c)) for p, c in mod.SMPL_SKELETON],
-            "part_map": {(int(p), int(c)): str(v) for (p, c), v in mod.BONE_PART_MAP.items()},
-        }, "import skeleton_spec（权威，含模块级自检）"
-    except Exception as exc:              # noqa: BLE001 - 任何原因都退化到静态解析
-        return None, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:              # noqa: BLE001 - import 本身失败（语法错等）
+        return None, f"{type(exc).__name__}: {exc}", False
     finally:
         try:
             sys.path.remove(str(engine_dir))
         except ValueError:
             pass
+
+    # import 成功；尝试 validate_self_consistency（触发 pkl 惰性加载）
+    try:
+        problems = list(mod.validate_self_consistency())
+        if problems:                      # SSOT 自证失败 → 不能当权威值用
+            return None, f"SSOT 自检未通过: {problems}", True
+        return {
+            "joint_names": list(mod.SMPL_JOINT_NAMES),
+            "parents": [int(p) for p in mod.SMPL_PARENTS],
+            "skeleton": [(int(p), int(c)) for p, c in mod.SMPL_SKELETON],
+            "part_map": {(int(p), int(c)): str(v) for (p, c), v in mod.BONE_PART_MAP.items()},
+        }, "import skeleton_spec（权威，含模块级自检）", True
+    except FileNotFoundError:
+        # pkl 不可用 → 退化到 AST，但标记 pkl_available=False
+        return None, "pkl 不可用（validate_self_consistency → FileNotFoundError）", False
+    except Exception as exc:              # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}", False
 
 
 # AST 静态解析用到的 BONE_PART_MAP 构造链（与 skeleton_spec.py 现有写法一一对应）
@@ -442,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     # --- SSOT 侧 ---
-    spec, how = load_spec_dynamic(engine_dir)
+    pkl_available = True   # 默认假设可用；load_spec_dynamic 会修正
+    spec, how, pkl_available = load_spec_dynamic(engine_dir)
     if spec is None:
         rep.info(f"import skeleton_spec 不可用（{how}）→ 退化为 AST 静态解析字面量")
         try:
@@ -451,6 +474,12 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:              # noqa: BLE001
             rep.error(f"SSOT 静态解析失败: {type(exc).__name__}: {exc}")
             return 2
+        # pkl 不可用 → AST 只能校验拓扑不变量，pkl 派生的不变量（骨长界/rest/对称对）未覆盖
+        if not pkl_available:
+            rep.warn("pkl 不可用 → 以下不变量**未被本次校验覆盖**（运行时首次推理前会重试加载）：")
+            rep.warn("  · BONE_LENGTH_BOUNDS 键集合 = SMPL_SKELETON（骨长界数据驱动，需 pkl 派生 rest 骨长）")
+            rep.warn("  · 真实 rest 骨长落在界内（构造性不变量，需 pkl 的 J_regressor @ v_template）")
+            rep.warn("  · 对称骨对互为真解剖镜像（需 skeleton_set 完整校验）")
     rep.info(f"SSOT 取值方式: {how}")
 
     try:
@@ -488,6 +517,9 @@ def main(argv: list[str] | None = None) -> int:
 
     compare(spec, fe, rep)
 
+    # --- skeleton_validator.py 迁移检查（G12 覆盖引擎侧第三份骨架常量副本）---
+    check_skeleton_validator_migration(engine_dir, rep)
+
     print("-" * 78)
     if rep.errors and not rep.drifts:
         print(f"==> G12/G8-SSOT 无法完成校验（{len(rep.errors)} 项解析/结构错误）")
@@ -499,8 +531,70 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    由 neck({NECK}) 改为 spine3({SPINE3})，即 [12,13]/[12,14] → [9,13]/[9,14]，")
         print("    并同步 BONE_PART_MAP 的左右臂链首条边；如导出 SMPL_PARENTS 则与 SSOT 逐项对齐。")
         return 1
-    print("==> G12/G8-SSOT PASS：前端 skeleton.ts 与 SSOT skeleton_spec.py 完全一致")
+    # pkl 不可用但拓扑一致 → SKIP（非 PASS，因 pkl 派生不变量未覆盖）
+    if not pkl_available:
+        print(f"==> G12/G8-SSOT SKIP：拓扑一致（A1-A4）但 pkl 不可用，{len(rep.warnings)} 项不变量未覆盖")
+        print("    运行时首次推理前会重试加载 pkl 派生常量（BONE_LENGTH_BOUNDS / rest 骨长）。")
+        return 3
+    print("==> G12/G8-SSOT PASS：前端 skeleton.ts 与 SSOT skeleton_spec.py 完全一致"
+          "（含 skeleton_validator.py 迁移检查）")
     return 0
+
+
+# -----------------------------------------------------------------------------
+# G12 扩展：检查 skeleton_validator.py 是否已从 SSOT import（不再保留本地副本）
+# -----------------------------------------------------------------------------
+_REQUIRED_SSOT_IMPORTS = {
+    "SMPL_JOINT_NAMES", "SMPL_SKELETON", "BONE_PART_MAP",
+    "BONE_LENGTH_BOUNDS", "BONE_NAMES",
+}
+_FORBIDDEN_LOCAL_COPIES = {"SMPL_SKELETON", "BONE_VALIDITY"}
+
+
+def check_skeleton_validator_migration(engine_dir: Path, rep: Report) -> None:
+    """检查 skeleton_validator.py 是否已迁移到从 skeleton_spec import（G12 扩展覆盖）。
+
+    断言：
+    A5 文件存在时，必须 `from skeleton_spec import ...` 导入 5 个 SSOT 符号。
+    A6 不得保留本地 SMPL_SKELETON / BONE_VALIDITY 常量副本。
+    文件不存在时记 INFO（可选组件）。
+    """
+    sv_path = engine_dir / "skeleton_validator.py"
+    if not sv_path.exists():
+        rep.info("A5/A6 skeleton_validator.py 不存在（可选组件，跳过）")
+        return
+
+    src = sv_path.read_text(encoding="utf-8")
+
+    # A5：必须从 skeleton_spec import 5 个符号
+    missing_imports = []
+    for sym in sorted(_REQUIRED_SSOT_IMPORTS):
+        if f"from skeleton_spec import" not in src or sym not in src:
+            missing_imports.append(sym)
+    # 更精确：检查 from skeleton_spec import (...) 块是否包含所有符号
+    import re as _re
+    m = _re.search(r"from\s+skeleton_spec\s+import\s*\(([^)]+)\)", src, _re.DOTALL)
+    if m:
+        import_block = m.group(1)
+        for sym in sorted(_REQUIRED_SSOT_IMPORTS):
+            if sym not in import_block:
+                missing_imports.append(sym)
+    elif "from skeleton_spec import" not in src:
+        missing_imports = sorted(_REQUIRED_SSOT_IMPORTS)
+
+    if missing_imports:
+        rep.drift(f"A5 skeleton_validator.py 未从 skeleton_spec import: {', '.join(missing_imports)}")
+    else:
+        rep.ok("A5 skeleton_validator.py 从 skeleton_spec import 5 个 SSOT 符号（已迁移）")
+
+    # A6：不得保留本地 SMPL_SKELETON / BONE_VALIDITY 常量定义
+    for forbidden in sorted(_FORBIDDEN_LOCAL_COPIES):
+        # 匹配 `SMPL_SKELETON = [...]` 或 `BONE_VALIDITY = {...}` 这类赋值
+        if _re.search(rf"^\s*{forbidden}\s*=\s*[\[\{{]", src, _re.MULTILINE):
+            rep.drift(f"A6 skeleton_validator.py 仍保留本地副本 {forbidden}（应从 skeleton_spec import）")
+    if not any(_re.search(rf"^\s*{f}\s*=\s*[\[\{{]", src, _re.MULTILINE)
+               for f in _FORBIDDEN_LOCAL_COPIES):
+        rep.ok("A6 skeleton_validator.py 无本地骨架常量副本（SMPL_SKELETON/BONE_VALIDITY 已删除）")
 
 
 if __name__ == "__main__":

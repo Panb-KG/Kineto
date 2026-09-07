@@ -13,7 +13,7 @@
 
 import { ApiError, fetchPoseData, isApiConfigured } from "./api";
 import type { PoseData } from "./types";
-import { JOINT_COUNT } from "./types";
+import { JOINT_COUNT, JOINT_ORDER_CANONICAL } from "./types";
 
 /**
  * 内置示例数据（复制自关节序根因整改后的 canonical 产物
@@ -81,6 +81,11 @@ export async function loadPoseData(
  *  - smpl_thetas（canonical 为 72 维）/ cam_t / betas / confidence_score 均为
  *    **可选 additive** 字段：缺失一律接受，存在时仅校验形状合法（数组 /
  *    cam_t 为 3 维），绝不因维度差异或缺失而拒绝加载。
+ *
+ * 全帧验证（修复 #18）：
+ *  所有 keyframes 均校验 joints_3d 形状（24 × [x,y,z]），而非仅首帧；
+ *  首帧额外做 additive 字段（smpl_thetas/cam_t/betas）的宽松形状校验。
+ *  466 帧 × 24 关节 ≈ 1.1 万次判断，开销 <1ms。
  */
 export function validatePoseData(data: PoseData): void {
   if (!data || typeof data !== "object") {
@@ -92,17 +97,34 @@ export function validatePoseData(data: PoseData): void {
   if (!Array.isArray(data.keyframes) || data.keyframes.length === 0) {
     throw new Error("pose_data 结构非法：keyframes 为空");
   }
-  const first = data.keyframes[0];
-  if (!Array.isArray(first.joints_3d) || first.joints_3d.length !== JOINT_COUNT) {
-    throw new Error(
-      `pose_data 结构非法：joints_3d 应为 ${JOINT_COUNT} 个关节，实际 ${first.joints_3d?.length}`,
+
+  // ── joint_order 告警（M3）：非 canonical 序时 console.warn，UI 层另行展示 ──
+  const jointOrder = data.metadata.joint_order;
+  if (jointOrder !== undefined && jointOrder !== JOINT_ORDER_CANONICAL) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[kineto] joint_order = "${jointOrder}"（非 "${JOINT_ORDER_CANONICAL}"），` +
+        "前端 skeleton.ts 镜像 canonical 序，渲染结果可能偏斜。",
     );
   }
-  if (first.joints_3d.some((j) => !Array.isArray(j) || j.length !== 3)) {
-    throw new Error("pose_data 结构非法：joints_3d 中存在非 [x,y,z] 项");
-  }
 
-  // additive 可选字段：存在时做宽松形状校验，不因维度不同而拒绝 canonical 数据。
+  // ── 全帧形状硬校验（修复 #18：从只校验 keyframes[0] 改为全帧）──
+  data.keyframes.forEach((kf, i) => {
+    if (!Array.isArray(kf.joints_3d) || kf.joints_3d.length !== JOINT_COUNT) {
+      throw new Error(
+        `pose_data 结构非法：keyframes[${i}].joints_3d 应为 ${JOINT_COUNT} 个关节，` +
+        `实际 ${kf.joints_3d?.length ?? "undefined"}`,
+      );
+    }
+    if (kf.joints_3d.some((j) => !Array.isArray(j) || j.length !== 3)) {
+      throw new Error(
+        `pose_data 结构非法：keyframes[${i}].joints_3d 中存在非 [x,y,z] 项`,
+      );
+    }
+  });
+
+  // ── 首帧 additive 可选字段宽松校验（存在时校验形状，缺失则接受）──
+  const first = data.keyframes[0];
   if (first.smpl_thetas !== undefined && !Array.isArray(first.smpl_thetas)) {
     throw new Error("pose_data 结构非法：smpl_thetas 存在但不是数组");
   }

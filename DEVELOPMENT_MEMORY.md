@@ -38,6 +38,16 @@
 - `.env.example` / `README.md` 三模式表更新：public-prod 改为 Funnel 地址。
 - 前端 Zeabur 生产部署的前置条件已满足：在 Zeabur 项目环境变量设 `ENGINE_API_BASE=https://aibox.tail6791a3.ts.net` + `KINETO_API_KEY=<key>` 即可。
 
+### 2026-09-07 Ultra Review 修复轮次 + AI BOX 重新部署
+- Ultra Review 发现 3 Critical + 4 Major + ~15 Minor 问题，启动全面整改：
+  - **引擎 22 项修复**（Bill）：Rodrigues 最小旋转替代 Kabsch for K=1、SSOT 惰性加载（`_resolve_pkl_path` 环境变量优先）、`clip_info` 跨轮累积（不再每轮清零）、`rel_violation` 只对被夹帧求均值、`compute_verdict` 量纲一致（骨数 + spike_ratio>0.10?1:0）、`skeleton_validator` M4 迁移（5 符号从 `skeleton_spec` 导入）、metadata 判别位 `joint_order=smpl-canonical` + `schema_version=2`
+  - **部署 4 项修复**（Kevin）：`check_ssot` 优雅降级（pkl 不可用时 exit code 3 SKIP）、G12 覆盖 `skeleton_validator`、`Dockerfile.engine` §6c 构建期断言（24 joints / 23 edges / collar parent=9）、`validate.sh` G13 黄金样本（断言 `output_test` verdict=pass）
+  - **前端 6 项修复**（Aaron）：`validatePoseData` 全帧校验（非只首帧）、`degraded` 横幅（`UploadPanel` / `ViewerStage`）、`joint_order` 非 canonical 时告警（`MetadataPanel`）
+- `output_test` / `output_closed` 重生成：verdict=pass, total_issues=0, joint_order=smpl-canonical, schema_version=2, 质量分 0.9936
+- **AI BOX 重新部署**：rsync 代码（commit cdba171）+ 重启服务 + 验收 **12 PASS / 3 SKIP / 0 FAIL** ✅
+- 验收基线更新：质量分 0.9936（原 0.6726，因 `clip_info` 跨轮累积后更诚实反映约束违反程度）
+- 部署踩坑：`/srv/kineto/` 目录权限 750→755（juxin 无 traverse 权限导致 validate.sh G3 403）；旧视频 `/opt/kineto/kineto-engine/input_video.mp4` 需删除（validate.sh 优先探测该路径但不在 inbox 内）
+
 ## 3. 核心信息速查（设备与服务）
 
 ### 访问方式
@@ -70,8 +80,9 @@
 | `GET /jobs/{id}/pose_data.json` / `demo_output.mp4` | 完成后取产物 |
 
 ### 验收基线（复验锚点）
-- 466 帧视频，device=xpu，4dhumans，质量分 0.6726，~62s；`KINETO_API_KEY=$(grep KINETO_API_KEY /etc/kineto/kineto-engine.env | cut -d= -f2) bash deploy/validate.sh --mofang-mode stripped`
+- 466 帧视频，device=xpu，4dhumans，质量分 0.9936，~62s；`KINETO_API_KEY=$(grep KINETO_API_KEY /etc/kineto/kineto-engine.env | cut -d= -f2) bash deploy/validate.sh --mofang-mode stripped`
 - reboot 复验：服务自启、XPU/模型就绪、E2E 通过。
+- 产物 metadata：`joint_order=smpl-canonical` + `schema_version=2`（schema additive，向后兼容）。
 
 ## 4. 踩坑与解法（硬约束）
 

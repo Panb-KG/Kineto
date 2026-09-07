@@ -151,8 +151,10 @@ else warn "本机无 sha256sum/shasum —— 将退化为只比对文件大小";
                              || { bad "缺少 $ENGINE_DIR/yolov8n.pt"; FAIL=1; }
 
 SMPL_PKL="$ENGINE_DIR/4D-Humans/data/basicModel_neutral_lbs_10_207_0_v1.0.0.pkl"
+# [Ultra Review] SSOT 落地后 basicModel pkl 不再是“可选”：skeleton_spec 的惰性加载
+# 在首次推理时触发，缺 pkl → FileNotFoundError → job 失败。warn 升级为 bad+FAIL。
 [ -f "$SMPL_PKL" ]           && ok "本地 SMPL 基础模型存在 ($(du -h "$SMPL_PKL" | awk '{print $1}'))" \
-                             || warn "缺少 ${SMPL_PKL}（缓存里的 data/smpl/SMPL_NEUTRAL.pkl 已够用，可继续）"
+                             || { bad "缺少 ${SMPL_PKL}（SSOT 惰性加载在首次推理时触发，缺 pkl → job 失败；必须提供）"; FAIL=1; }
 
 HMR2_CKPT="$LOCAL_CACHE/logs/train/multiruns/hmr2/0/checkpoints/epoch=35-step=1000000.ckpt"
 [ -f "$HMR2_CKPT" ]          && ok "HMR2 权重存在 (2.5GB 主文件)" \

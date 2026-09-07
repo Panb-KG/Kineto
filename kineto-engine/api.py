@@ -815,6 +815,16 @@ def get_demo_video(job_id: str) -> FileResponse:
     return _serve_artifact(job_id, "demo_output.mp4")
 
 
+@app.get("/jobs/{job_id}/input.mp4", dependencies=[Depends(require_api_key)])
+def get_input_video(job_id: str) -> FileResponse:
+    """返回原始上传视频"""
+    job_dir = JOBS_DIR / job_id
+    input_path = job_dir / "input.mp4"
+    if not input_path.exists():
+        raise HTTPException(status_code=404, detail="input video not found")
+    return FileResponse(input_path, media_type="video/mp4")
+
+
 if __name__ == "__main__":
     import uvicorn
 

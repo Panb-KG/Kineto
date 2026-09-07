@@ -250,9 +250,17 @@ run_ssot_gate() {
            info "              SMPL_SKELETON 为 23 条真 kintree 边，BONE_PART_MAP 键集合与之相同。"
            info "    修法属前端 Owner（本闸门不 codegen）：改 kineto-web/lib/skeleton.ts 后重跑 --ssot-only。"
            record "G12 SSOT骨架" "FAIL" "SSOT ↔ skeleton.ts 漂移" ;;
-        3) warn "G12 无法校验：缺 skeleton_spec.py 或 skeleton.ts（设备上通常没有 kineto-web/）"
-           info "    请在**仓库检出**（Mac/CI）上跑：bash deploy/validate.sh --ssot-only"
-           record "G12 SSOT骨架" "SKIP" "文件缺失（非仓库检出？）" ;;
+        3) # SKIP：可能是文件缺失（非仓库检出）或 pkl 不可用（Docker 构建期/XPU）
+           if printf '%s' "$out" | grep -q 'pkl 不可用'; then
+               warn "G12 SKIP：pkl 不可用（Docker 构建期/XPU 环境）→ 拓扑一致但 pkl 派生不变量未覆盖"
+               info "    运行时首次推理前会重试加载 pkl 派生常量（BONE_LENGTH_BOUNDS / rest 骨长）。"
+               info "    未覆盖不变量：骨长界键集合/rest 骨长落界/对称骨对镜像。"
+               record "G12 SSOT骨架" "SKIP" "pkl 不可用（拓扑一致，pkl 派生未覆盖）"
+           else
+               warn "G12 无法校验：缺 skeleton_spec.py 或 skeleton.ts（设备上通常没有 kineto-web/）"
+               info "    请在**仓库检出**（Mac/CI）上跑：bash deploy/validate.sh --ssot-only"
+               record "G12 SSOT骨架" "SKIP" "文件缺失（非仓库检出？）"
+           fi ;;
         *) bad "G12 校验无法完成（退出码 $rc：解析/结构错误）—— 不能证明一致即视为不安全"
            record "G12 SSOT骨架" "FAIL" "校验器退出码 $rc" ;;
     esac
@@ -790,6 +798,36 @@ fi
 # G12 / G8-SSOT  骨架单一事实源一致性（静态、只读；函数定义在脚本头部）
 # ---------------------------------------------------------------------------
 run_ssot_gate
+
+# ---------------------------------------------------------------------------
+# G13  黄金样本基线（静态、只读；断言 output_test 的 audit verdict=pass）
+#   引擎侧整改后，黄金样本 output_test/audit_iter0/audit_results.json 必须
+#   verdict=pass（而非 warn）。这是部署前的基线断言，把 warn 通胀挡在部署前。
+#   文件不存在时记 SKIP（非仓库检出 / 引擎未重生成）。
+# ---------------------------------------------------------------------------
+step "G13  黄金样本基线（output_test audit verdict=pass）"
+GOLDEN_DIR="${REPO_ROOT}/kineto-engine/output_test"
+GOLDEN_AUDIT="${GOLDEN_DIR}/audit_iter0/audit_results.json"
+if [ ! -f "$GOLDEN_AUDIT" ]; then
+    warn "G13 跳过：黄金样本不存在（$GOLDEN_AUDIT）"
+    info "    请在仓库检出上重生成：cd kineto-engine && python kineto_core.py --refine --output-dir output_test"
+    record "G13 黄金样本" "SKIP" "audit_results.json 不存在"
+else
+    GOLDEN_VERDICT="$(json_get "$GOLDEN_AUDIT" "d.get('verdict','')")"
+    GOLDEN_ISSUES="$(json_get "$GOLDEN_AUDIT" "d.get('total_issues','')")"
+    GOLDEN_SCORE="$(json_get "$GOLDEN_AUDIT" "d.get('final_quality_score','')")"
+    info "verdict=${GOLDEN_VERDICT:-<empty>}  total_issues=${GOLDEN_ISSUES:-<empty>}  final_quality_score=${GOLDEN_SCORE:-<empty>}"
+    if [ "$GOLDEN_VERDICT" = "pass" ]; then
+        ok "G13 黄金样本 verdict=pass（warn 通胀已修复，基线干净）"
+        record "G13 黄金样本" "PASS" "verdict=pass"
+    else
+        bad "G13 黄金样本 verdict=${GOLDEN_VERDICT:-<empty>} != pass —— warn 通胀未修复或引擎未重生成"
+        info "    期望：引擎侧 compute_verdict 整改后，干净数据必须 verdict=pass。"
+        info "    排查：kineto-engine/output_test/audit_iter0/audit_results.json 的 total_issues/failure_reason"
+        info "    修复：引擎整改后重跑 python kineto_core.py --refine --output-dir output_test"
+        record "G13 黄金样本" "FAIL" "verdict=${GOLDEN_VERDICT:-empty}"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 汇总

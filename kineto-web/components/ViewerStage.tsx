@@ -12,15 +12,19 @@
 
 import { useEffect, useMemo, useState } from "react";
 import dynamic from "next/dynamic";
-import KeyframeCards from "./KeyframeCards";
 import MetadataPanel from "./MetadataPanel";
 import TimelineControls from "./TimelineControls";
 import { loadPoseData, type LoadedPoseData } from "../lib/poseData";
+import { getJob } from "../lib/api";
 import { useTimeline } from "../lib/useTimeline";
 
 const SkeletonViewer = dynamic(() => import("./SkeletonViewer"), {
   ssr: false,
   loading: () => <div className="viewer-skeleton-loading">初始化 3D 引擎…</div>,
+});
+
+const VideoCompare = dynamic(() => import("./VideoCompare"), {
+  ssr: false,
 });
 
 interface ViewerStageProps {
@@ -35,6 +39,8 @@ type Phase =
 
 export default function ViewerStage({ jobId }: ViewerStageProps) {
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
+  // m13: 跟踪 job 的 degraded 状态，用于显示质量降级横幅
+  const [degraded, setDegraded] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -57,6 +63,16 @@ export default function ViewerStage({ jobId }: ViewerStageProps) {
     };
   }, [jobId]);
 
+  // m13: 当 jobId 存在时，查询 job 状态以获取 degraded 标志
+  useEffect(() => {
+    if (!jobId) { setDegraded(false); return; }
+    const controller = new AbortController();
+    getJob(jobId, controller.signal)
+      .then((job) => { if (job.degraded) setDegraded(true); })
+      .catch(() => { /* 查询失败不影响主流程 */ });
+    return () => controller.abort();
+  }, [jobId]);
+
   if (phase.kind === "loading") {
     return (
       <div className="stage-status">
@@ -75,11 +91,21 @@ export default function ViewerStage({ jobId }: ViewerStageProps) {
     );
   }
 
-  return <ReadyStage loaded={phase.loaded} />;
+  return (
+    <ReadyStage loaded={phase.loaded} degraded={degraded} jobId={jobId} />
+  );
 }
 
 /** 数据就绪后的实际渲染（独立组件以便安全调用 useTimeline）。 */
-function ReadyStage({ loaded }: { loaded: LoadedPoseData }) {
+function ReadyStage({
+  loaded,
+  degraded,
+  jobId,
+}: {
+  loaded: LoadedPoseData;
+  degraded?: boolean;
+  jobId?: string;
+}) {
   const { data, source, fallbackReason } = loaded;
   const keyframes = useMemo(() => data.keyframes, [data]);
   const { timeline, playing, durationMs, toggle } = useTimeline(keyframes, true);
@@ -114,8 +140,17 @@ function ReadyStage({ loaded }: { loaded: LoadedPoseData }) {
         </div>
       )}
 
-      {/* 上半部分：4 张关键帧指导图（占位） */}
-      <KeyframeCards />
+      {/* m13: 质量降级横幅 —— 引擎判定产物质量未达标但仍交付 */}
+      {degraded && source === "api" && (
+        <div className="stage-banner stage-banner--degraded" role="alert">
+          <span className="stage-banner__tag" aria-hidden>
+            DEGRADED
+          </span>
+          <span className="stage-banner__text">
+            质量降级交付：引擎判定该任务产物质量未达标，结果仅供参考。
+          </span>
+        </div>
+      )}
 
       {/* 下半部分：3D 骨架视图 + 控制条 + 元数据 */}
       <section className="viewer-section" aria-label="3D 骨架交互视图">
@@ -139,6 +174,11 @@ function ReadyStage({ loaded }: { loaded: LoadedPoseData }) {
           />
         </div>
       </section>
+
+      {/* 视频对比：仅当 job 完成且来源为 API 时显示 */}
+      {source === "api" && jobId && (
+        <VideoCompare jobId={jobId} />
+      )}
     </>
   );
 }

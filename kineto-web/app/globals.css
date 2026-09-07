@@ -597,6 +597,22 @@ body::before {
   color: #93501f;
 }
 
+/* 质量降级横幅：比 SAMPLE 更醒目的红色调，强调质量未达标 */
+.stage-banner--degraded {
+  background: #fdf2f2;
+  border-color: #f0b0b0;
+  border-left-color: #c53030;
+  color: #c53030;
+}
+
+.stage-banner--degraded .stage-banner__tag {
+  background: #c53030;
+}
+
+.stage-banner--degraded .stage-banner__text {
+  color: #9b2c2c;
+}
+
 /* ── 上传面板 ─────────────────────────────────── */
 .upload-panel {
   border: 1px solid var(--line);
@@ -845,6 +861,46 @@ body::before {
   }
 }
 
+/* ── 视频对比 ────────────────────────────────────────────────────────── */
+.video-compare {
+  margin-top: 40px;
+  animation: fadeUp 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) 0.5s both;
+}
+
+.video-compare .section-label {
+  margin-bottom: 16px;
+}
+
+.video-compare__pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+
+.video-compare__slot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.video-compare__label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.video-compare__video {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-sm);
+  object-fit: contain;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -865,6 +921,9 @@ body::before {
   }
   .kf-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+  .video-compare__pair {
+    grid-template-columns: 1fr;
   }
 }
 

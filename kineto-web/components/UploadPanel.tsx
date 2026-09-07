@@ -30,7 +30,7 @@ type UploadPhase =
   | { kind: "idle" }
   | { kind: "uploading" }
   | { kind: "processing"; job: JobStatus | null }
-  | { kind: "done"; jobId: string }
+  | { kind: "done"; jobId: string; degraded: boolean }
   | { kind: "timeout"; jobId: string }
   | { kind: "offline"; message: string }
   | { kind: "error"; message: string };
@@ -84,14 +84,13 @@ export default function UploadPanel({ timeoutMs: timeoutProp }: UploadPanelProps
       // MJ1：立即把 jobId 写入 URL，超时/刷新后仍可恢复。
       gotoJob(jobId);
       try {
-        const done = await pollJobUntilDone(jobId, {
+        const doneJob = await pollJobUntilDone(jobId, {
           intervalMs: POLL_INTERVAL_MS,
           timeoutMs,
           onProgress: (job) => setPhase({ kind: "processing", job }),
         });
-        setPhase({ kind: "done", jobId });
+        setPhase({ kind: "done", jobId, degraded: !!doneJob.degraded });
         gotoJob(jobId);
-        void done;
       } catch (err) {
         // MJ1：单纯超时不得判为离线——保留 jobId，提示可继续等待/稍后重连。
         if (err instanceof ApiTimeoutError) {
@@ -194,9 +193,16 @@ export default function UploadPanel({ timeoutMs: timeoutProp }: UploadPanelProps
           )}
 
           {phase.kind === "done" && (
-            <span className="upload-note upload-note--ok">
-              ✓ 任务完成，正在加载姿态数据（job={phase.jobId.slice(0, 8)}…）
-            </span>
+            <>
+              <span className="upload-note upload-note--ok">
+                ✓ 任务完成，正在加载姿态数据（job={phase.jobId.slice(0, 8)}…）
+              </span>
+              {phase.degraded && (
+                <span className="upload-note upload-note--warn" role="alert">
+                  ⚠ 质量降级交付：引擎判定该任务产物质量未达标，结果仅供参考。
+                </span>
+              )}
+            </>
           )}
 
           {phase.kind === "timeout" && (

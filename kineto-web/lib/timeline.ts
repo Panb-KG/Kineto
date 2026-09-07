@@ -250,108 +250,34 @@ export function sampleJoints(
   return out;
 }
 
-/**
- * computeFraming 返回的完整帧变换。
- * rotation 为 3×3 行主序矩阵（Float32Array(9)），用于将 SMPL 相机空间的
- * 姿态朝向校正到 Three.js Y-up 约定。
- */
+/** computeFraming 返回的帧变换（居中 + 缩放）。 */
 export interface FrameTransform {
   offset: [number, number, number];
   scale: number;
-  /** 3×3 行主序旋转矩阵，将 SMPL 坐标旋转到 Y-up 场景空间。 */
-  rotation: Float32Array;
-}
-
-/**
- * 计算 SMPL → Y-up 的朝向校正旋转矩阵。
- *
- * 几何原理：
- *   SMPL 引擎输出相机空间坐标，身体长轴方向取决于拍摄姿态——仰卧时 spine
- *   沿 X 轴，站立时沿 Y 轴。Three.js 场景使用 Y-up 约定，需要把 spine 对齐
- *   到 +Y 方向。
- *
- *   算法：对所有帧的 spine 向量（joint12 − joint0，即 neck − pelvis）求平均，
- *   得到姿态主方向；然后用 Rodrigues 旋转公式构造将该方向对齐到 +Y 的矩阵。
- *   仅计算一次，不逐帧重算。
- *
- *   对已经是站立姿态（spine ≈ +Y）的视频，旋转角趋近 0，矩阵趋近单位阵，
- *   不影响现有行为。
- */
-function computeOrientationRotation(keyframes: Keyframe[]): Float32Array {
-  // 累积 spine 向量并取平均，比单帧更鲁棒
-  let sx = 0, sy = 0, sz = 0;
-  for (const kf of keyframes) {
-    const j = kf.joints_3d;
-    if (j.length > 12) {
-      sx += j[12][0] - j[0][0];
-      sy += j[12][1] - j[0][1];
-      sz += j[12][2] - j[0][2];
-    }
-  }
-  const len = Math.sqrt(sx * sx + sy * sy + sz * sz);
-  if (len < 1e-6) return new Float32Array([1,0,0, 0,1,0, 0,0,1]);
-  sx /= len; sy /= len; sz /= len;
-
-  // 与 +Y 的点积 → 夹角余弦
-  const dot = sy; // spine · (0,1,0)
-  // 已对齐（夹角 < ~3°），直接返回单位阵
-  if (dot > 0.995) return new Float32Array([1,0,0, 0,1,0, 0,0,1]);
-
-  // 旋转轴 = spine × Y，归一化
-  let ax = sz, ay = 0, az = -sx; // (sx,sy,sz) × (0,1,0)
-  const axLen = Math.sqrt(ax * ax + az * az);
-  if (axLen < 1e-8) {
-    // spine ≈ -Y（完全倒置），绕任意垂直轴转 π
-    ax = 1; az = 0;
-  } else {
-    ax /= axLen; az /= axLen;
-  }
-
-  // Rodrigues 旋转矩阵 R = I·cos θ + (1−cos θ)·k⊗k + sin θ·[k]×
-  // 其中 cos θ = dot, sin θ = axLen（因为 k 是归一化的叉积方向）
-  const c = dot;
-  const s = axLen;
-  const t = 1 - c;
-  // 代入 k=(ax, 0, az) 化简后的 3×3 行主序矩阵
-  return new Float32Array([
-    c + t * ax * ax,     t * ax * ay + s * az,  t * ax * az - s * ay, // row0
-    t * ay * ax - s * az, c + t * ay * ay,       t * ay * az + s * ax, // row1
-    t * az * ax + s * ay, t * az * ay - s * ax,  c + t * az * az,      // row2
-  ]);
 }
 
 /**
  * 计算把骨架居中并归一化到目标尺寸所需的偏移与缩放。
  * 基于所有关键帧的全局包围盒，保证整段动画使用同一变换，骨架不会漂移。
- *
- * 同时计算 SMPL → Y-up 的朝向校正旋转（见 computeOrientationRotation），
- * 使仰卧视频（spine 沿 X）也能正确直立显示。
  */
 export function computeFraming(
   keyframes: Keyframe[],
   targetSize = 2.4,
 ): FrameTransform {
-  const rotation = computeOrientationRotation(keyframes);
-
   if (keyframes.length === 0) {
-    return { offset: [0, 0, 0], scale: 1, rotation };
+    return { offset: [0, 0, 0], scale: 1 };
   }
 
-  // 先对全部关节施加旋转，再在旋转后的空间计算包围盒
-  // 这样居中/缩放的变换与旋转后的姿态匹配，不会偏移
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   for (const kf of keyframes) {
     for (const [x, y, z] of kf.joints_3d) {
-      const rx = rotation[0]*x + rotation[1]*y + rotation[2]*z;
-      const ry = rotation[3]*x + rotation[4]*y + rotation[5]*z;
-      const rz = rotation[6]*x + rotation[7]*y + rotation[8]*z;
-      if (rx < minX) minX = rx;
-      if (ry < minY) minY = ry;
-      if (rz < minZ) minZ = rz;
-      if (rx > maxX) maxX = rx;
-      if (ry > maxY) maxY = ry;
-      if (rz > maxZ) maxZ = rz;
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (z < minZ) minZ = z;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+      if (z > maxZ) maxZ = z;
     }
   }
   const cx = (minX + maxX) / 2;
@@ -359,5 +285,5 @@ export function computeFraming(
   const cz = (minZ + maxZ) / 2;
   const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6);
   const scale = targetSize / span;
-  return { offset: [-cx, -cy, -cz], scale, rotation };
+  return { offset: [-cx, -cy, -cz], scale };
 }

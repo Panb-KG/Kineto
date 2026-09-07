@@ -677,6 +677,14 @@ sudo -u kineto env HOME=/srv/kineto /opt/kineto/venv/bin/python -c \
 ls -l /opt/kineto/kineto-engine/yolov8n.pt      # 应是软链或实体文件
 ```
 
+skeleton_spec import 断言（上线前必跑）：
+
+```bash
+sudo -u kineto env HOME=/srv/kineto /opt/kineto/venv/bin/python -c \
+ "from skeleton_spec import validate_self_consistency; validate_self_consistency(); print('skeleton_spec SSOT OK')"
+# 必须输出 'skeleton_spec SSOT OK'；否则骨架常量不一致，引擎会静默产出错误骨架
+```
+
 ### 5.8 密钥 / CORS / systemd 部署
 
 ```bash
@@ -906,6 +914,18 @@ bash deploy/validate.sh --base https://kineto-api.<YOUR_DOMAIN> --api-key <key> 
 | **G10** | MoFang 回归 | `--mofang-mode coexist`：两项必须绿；`stripped`：确认已停 | §11 |
 | G11 | Zeabur 前端可达性 | `--web-base`：站点 2xx/3xx + 同源代理 `/api/health`=200；仅当另传 `--web-origin`（仍直连）时附带 CORS 预检 | `DEPLOY_ZEABUR.md` |
 | **G12** | 骨架 SSOT 一致性（G8-SSOT） | `skeleton_spec.py` ↔ `skeleton.ts` 关节名/父表/边/part_map 逐项一致（collar 13/14 父=9） | `deploy/check_ssot.py` |
+| G13 | 黄金样本基线 | `output_test/audit_iter0/audit_results.json` 的 `verdict == "pass"`（非 warn/fail） | 在仓库检出上重生成：`cd kineto-engine && python kineto_core.py -i ../videos/input_video.mp4 -o output_test --max-iter 2` |
+
+**产物 metadata 新增字段**（schema additive，向后兼容）：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `metadata.joint_order` | `"smpl-canonical"` | joints_3d 为 SMPL canonical 24 序（经 J_regressor 从 vertices 计算，非 OpenPose Body-25 序） |
+| `metadata.schema_version` | `2` | pose_data schema 第 2 版（canonical 关节序 + 本判别位） |
+
+**degraded 状态**：当 `KINETO_QUALITY_GATE=warn`（默认）时，质量不达标 job 仍 `done` 但响应体附 `degraded=true` + `quality_warning` 字段。前端据此展示警告横幅（`UploadPanel` / `ViewerStage` 已接线）。
+
+**诚实质量分**：`clip_info` 跨 iteration 累积（不再每轮清零），`rel_violation` 只对被夹帧求均值。质量分反映真实约束违反程度，不再因迭代轮次增加而假高。
 
 **reboot 复验是硬性要求**（不是可选）：`sudo reboot` 后重跑一次 `validate.sh`，
 重点看 `/dev/dri` 权限与两个服务是否自启。退出码 0 才算验收通过。
