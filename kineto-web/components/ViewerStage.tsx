@@ -43,6 +43,7 @@ interface ViewerStageProps {
 
 type Phase =
   | { kind: "loading" }
+  | { kind: "waiting"; message: string }
   | { kind: "ready"; loaded: LoadedPoseData }
   | { kind: "error"; message: string };
 
@@ -54,8 +55,58 @@ export default function ViewerStage({ jobId }: ViewerStageProps) {
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
+
+    /** 轮询等待 job 完成，间隔 2s，超时 15min */
+    async function waitForJob(targetJobId: string): Promise<void> {
+      const POLL_INTERVAL = 2000;
+      const POLL_TIMEOUT = 900_000;
+      const startedAt = Date.now();
+
+      while (true) {
+        if (controller.signal.aborted) return;
+        const job = await getJob(targetJobId, controller.signal);
+        if (!active) return;
+
+        if (job.state === "done") return;
+        if (job.state === "failed") {
+          throw new Error(job.error ?? "任务处理失败");
+        }
+
+        // still running / queued
+        const elapsed = Math.round((Date.now() - startedAt) / 1000);
+        if (Date.now() - startedAt > POLL_TIMEOUT) {
+          // 超时：回退到 loadPoseData（可能拿到数据也可能降级 fixture）
+          return;
+        }
+        setPhase({ kind: "waiting", message: `任务处理中，请稍候…（${elapsed}s）` });
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+      }
+    }
+
     (async () => {
       try {
+        // 有 jobId 时先检查 job 状态
+        if (jobId) {
+          try {
+            const job = await getJob(jobId, controller.signal);
+            if (!active) return;
+
+            if (job.state === "running" || job.state === "queued") {
+              // job 还在跑，轮询等待
+              setPhase({ kind: "waiting", message: "任务处理中，请稍候…" });
+              await waitForJob(jobId);
+              if (!active) return;
+            } else if (job.state === "failed") {
+              setPhase({ kind: "error", message: job.error ?? "任务处理失败" });
+              return;
+            }
+            // state === "done" → 继续往下 loadPoseData
+          } catch {
+            // getJob 失败（网络错误/404 等）→ 回退到 loadPoseData（会降级 fixture）
+            if (!active) return;
+          }
+        }
+
         const loaded = await loadPoseData(jobId, controller.signal);
         if (active) setPhase({ kind: "ready", loaded });
       } catch (err) {
@@ -87,6 +138,15 @@ export default function ViewerStage({ jobId }: ViewerStageProps) {
       <div className="stage-status">
         <div className="spinner" aria-hidden />
         <p>正在加载姿态数据…</p>
+      </div>
+    );
+  }
+
+  if (phase.kind === "waiting") {
+    return (
+      <div className="stage-status">
+        <div className="spinner" aria-hidden />
+        <p>{phase.message}</p>
       </div>
     );
   }
