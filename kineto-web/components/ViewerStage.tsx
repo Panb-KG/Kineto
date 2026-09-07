@@ -33,6 +33,11 @@ const VideoCompare = dynamic(() => import("./VideoCompare"), {
   ssr: false,
 });
 
+const CombinedViewer = dynamic(() => import("./CombinedViewer"), {
+  ssr: false,
+  loading: () => <div className="viewer-skeleton-loading">初始化叠加视图…</div>,
+});
+
 /** 3D 视图渲染模式 */
 type ViewMode = "skeleton" | "mesh" | "both";
 
@@ -270,17 +275,12 @@ function ReadyStage({
             />
           )}
           {viewMode === "both" && hasMesh && (
-            <div className="viewer-both-container">
-              <MeshViewer
-                keyframes={keyframes}
-                faces={data.mesh_faces!}
-                timeline={timeline}
-                showWireframe={showWireframe}
-              />
-              <div className="viewer-skeleton-overlay">
-                <SkeletonViewer keyframes={keyframes} timeline={timeline} />
-              </div>
-            </div>
+            <CombinedViewer
+              keyframes={keyframes}
+              faces={data.mesh_faces!}
+              timeline={timeline}
+              showWireframe={showWireframe}
+            />
           )}
 
           {/* 视图模式切换按钮 */}
