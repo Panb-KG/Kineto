@@ -292,15 +292,16 @@ class PoseExtractor:
 
         # ── 旋转欺骗触发判定 ──────────────────────────────────────────
         # 条件 A：检测框宽度 ≥ 高度 × 1.2（明显横向，覆盖平躺/死虫动作）
-        # 条件 B：bbox 未覆盖整帧（若 >95% 则是全身竖构图，不用旋转）
-        # 条件 C：bbox 需有一定面积（过小可能是误检噪声，跳过）
+        # 条件 B：bbox 需有一定面积（过小可能是误检噪声，跳过）
+        # 条件 C：排除"竖向全帧"——只有 bbox 既大（≥95%）又是竖向（宽高比≤1）
+        #         才认为是全身竖构图而跳过旋转；横向 bbox 即使占满画面也需旋转
         bbox_area = bw * bh
         frame_area = img_w * img_h
         is_horizontal = (bh > 1e-3) and (bw / bh >= 1.2)
-        is_not_full_frame = bbox_area < 0.95 * frame_area
         is_valid_size = bbox_area > 0.005 * frame_area  # 至少占画面 0.5%
+        is_vertical_full_frame = (bbox_area >= 0.95 * frame_area) and (bw / bh <= 1.0)
 
-        if is_horizontal and is_not_full_frame and is_valid_size:
+        if is_horizontal and is_valid_size and not is_vertical_full_frame:
             return self._extract_4dhumans_rotated(frame, person_bbox)
 
         result = self._solve_hmr2(frame, person_bbox)
