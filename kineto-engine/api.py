@@ -935,12 +935,13 @@ def get_input_video(job_id: str) -> FileResponse:
     return FileResponse(input_path, media_type="video/mp4")
 
 
-@app.get("/jobs/{job_id}/grid/{image_name}", dependencies=[Depends(require_api_key)])
+@app.get("/jobs/{job_id}/{image_name}", dependencies=[Depends(require_api_key)])
 def get_grid_image(job_id: str, image_name: str) -> FileResponse:
     """获取四宫格教学图（grid_01.jpg ~ grid_04.jpg）"""
     import re
     if not re.match(r'^grid_\d{2}\.jpg$', image_name):
-        raise HTTPException(status_code=400, detail="invalid grid image name")
+        # 不是 grid 图片，返回 404
+        raise HTTPException(status_code=404, detail=f"unknown artifact: {image_name}")
     return _serve_artifact(job_id, image_name)
 
 
