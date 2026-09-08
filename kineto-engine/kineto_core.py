@@ -1385,6 +1385,81 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
 
 
 # ============================================================================
+# 全帧骨骼标注视频生成
+# ============================================================================
+
+def _generate_annotated_video(video_path: str, keyframes: list, output_path: Path,
+                              focal_length: float = 5000.0, image_size: int = 256) -> str:
+    """生成全帧骨骼标注视频。
+
+    对视频全部帧逐帧处理，叠加 2D 骨骼投影。
+    输出为 annotated_output.mp4（H.264 编码）。
+
+    返回输出文件名（相对路径）。
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("[Annotated] ⚠️  无法打开视频，跳过标注视频生成", file=sys.stderr)
+        return ""
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if width <= 0 or height <= 0:
+        print("[Annotated] ⚠️  无法探测视频尺寸，跳过标注视频生成", file=sys.stderr)
+        cap.release()
+        return ""
+
+    # 创建输出视频（H.264 编码，浏览器兼容）
+    output_file = output_path / "annotated_output.mp4"
+    writer = None
+    for codec_tag, codec_label in [("avc1", "H.264"), ("mjpg", "MJPEG")]:
+        _f = cv2.VideoWriter_fourcc(*codec_tag)
+        _w = cv2.VideoWriter(str(output_file), _f, fps, (width, height))
+        if _w.isOpened():
+            writer = _w
+            print(f"[Annotated] 使用 {codec_label} ({codec_tag}) 编码输出标注视频")
+            break
+        _w.release()
+    if writer is None:
+        writer = cv2.VideoWriter(str(output_file), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        print("[Annotated] ⚠️  H.264/MJPEG 均不可用，回退 mp4v")
+
+    # 构建 frame_idx → keyframe 的快速索引
+    kf_by_frame = {kf.get("frame_index"): kf for kf in keyframes}
+
+    renderer = SkeletonRenderer(width, height, focal_length=focal_length, image_size=image_size)
+
+    processed = 0
+    for frame_idx in range(total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        kf = kf_by_frame.get(frame_idx)
+        if kf and "joints_3d" in kf:
+            joints_3d = np.array(kf["joints_3d"], dtype=np.float32)
+            cam_t = np.array(kf.get("cam_t", [0, 0, 0]), dtype=np.float32)
+            conf = float(kf.get("confidence_score", 1.0))
+            frame = renderer.draw_skeleton(frame, joints_3d, cam_t, conf)
+
+        writer.write(frame)
+        processed += 1
+
+        if processed % 100 == 0:
+            print(f"[Annotated] 进度: {processed}/{total_frames} 帧")
+
+    cap.release()
+    writer.release()
+
+    file_size_mb = output_file.stat().st_size / (1024 * 1024)
+    print(f"[Annotated] ✅ 生成完成: {output_file.name} ({processed} 帧, {file_size_mb:.1f}MB)")
+    return "annotated_output.mp4"
+
+
+# ============================================================================
 # 主流程: 视频逐帧解算
 # ============================================================================
 
@@ -1671,7 +1746,17 @@ def _process_video_impl(stack, input_path, output_dir, device,
     cap2.release()
     writer.release()
 
-    # ---- 第 4 步：生成四宫格教学图（关键帧截图 + 骨骼叠加）----
+    # ---- 第 4 步：生成全帧骨骼标注视频 ----
+    try:
+        annotated_video = _generate_annotated_video(
+            str(input_path), keyframes, output_path,
+            focal_length=extractor.focal_length, image_size=extractor.image_size)
+        if annotated_video:
+            print(f"[Annotated] 生成骨骼标注视频：{annotated_video}")
+    except Exception as exc:
+        print(f"[Annotated] ⚠️  标注视频生成失败（不影响主流程）: {exc}", file=sys.stderr)
+
+    # ---- 第 5 步：生成四宫格教学图（关键帧截图 + 骨骼叠加）----
     grid_result = {"grid_images": [], "grid_labels": []}
     # 从全部帧中均匀采样 4 个代表性关键帧（而非取前 4 个连续帧）
     n_total = len(keyframes)

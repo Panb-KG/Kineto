@@ -5,7 +5,7 @@
  *
  * 导出两个组件，由父组件通过 useVideoSync Hook 统一管理同步：
  *   - VideoCompare   → 主模型动图（demo_output.mp4），带播放控制
- *   - AnalysisVideo  → 解析动图（input.mp4），缩小版，放侧边栏元数据下方
+ *   - AnalysisVideo  → 解析动图（annotated_output.mp4），缩小版，放侧边栏元数据下方
  *
  * 布局根据视频宽高比自适应：横屏视频宽幅展示，竖屏视频收窄。
  */
@@ -114,7 +114,7 @@ export function AnalysisVideo({
   onAnalysisPause: () => void;
   onAnalysisSeek: () => void;
 }) {
-  const videoUrl = `${API_BASE}/jobs/${jobId}/input.mp4`;
+  const videoUrl = `${API_BASE}/jobs/${jobId}/annotated_output.mp4`;
 
   return (
     <div className="vc-analysis">
