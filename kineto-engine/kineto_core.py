@@ -398,7 +398,7 @@ class PoseExtractor:
             all_vertices = []
             faces = self.model.smpl.faces  # numpy array, shared across frames
 
-            for kf in keyframes[:4]:  # 最多 4 个关键帧
+            for kf in keyframes:  # 调用方已做均匀采样，此处不再硬编码截断
                 betas = kf.get("betas", [0] * 10)
                 smpl_thetas = kf.get("smpl_thetas", [0] * 72)
 
@@ -1233,7 +1233,12 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
                           focal_length: float = 5000.0, image_size: int = 256) -> dict:
     """生成四宫格教学图：关键帧截图 + 骨骼标注。
 
-    对最多 4 个关键帧截取视频帧并用 SkeletonRenderer 叠加 2D 骨骼投影。
+    对最多 4 个关键帧：
+    1. 读取完整视频帧
+    2. 根据人体 2D 投影 bbox 裁剪（带 20% padding）
+    3. 叠加骨骼标注
+    4. 所有图片 pad 到统一画布尺寸，确保四张大小一致
+
     失败不影响主流程（调用方须 try/except）。
 
     返回 {"grid_images": [filename, ...], "grid_labels": [label, ...]}
@@ -1251,14 +1256,21 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
         return {"grid_images": grid_images, "grid_labels": grid_labels}
 
     try:
-        # 探测视频尺寸以初始化 SkeletonRenderer
+        # 探测视频尺寸
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         if w <= 0 or h <= 0:
             print("[Grid] ⚠️  无法探测视频尺寸，跳过四宫格生成", file=sys.stderr)
             return {"grid_images": grid_images, "grid_labels": grid_labels}
 
-        renderer = SkeletonRenderer(w, h, focal_length=focal_length, image_size=image_size)
+        # 用于 bbox 投影的临时渲染器（全帧分辨率）
+        bbox_renderer = SkeletonRenderer(w, h, focal_length=focal_length,
+                                         image_size=image_size)
+
+        # ---- 第一遍：收集裁剪后的帧 ----
+        PAD_RATIO = 0.20          # bbox 四周留白比例
+        TARGET_H = 512            # 统一输出高度
+        cropped_frames = []       # (annotated_bgr, label)
 
         for idx, kf in enumerate(keyframes[:4]):
             frame_idx = kf.get("frame_index", 0)
@@ -1268,39 +1280,103 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
                 print(f"[Grid] ⚠️  帧 {frame_idx} 读取失败，跳过", file=sys.stderr)
                 continue
 
-            # 获取该帧的 3D 关节和相机参数
             joints_3d = np.array(kf["joints_3d"], dtype=np.float32)
             cam_t = np.array(kf.get("cam_t", [0, 0, 0]), dtype=np.float32)
             conf = float(kf.get("confidence_score", 1.0))
 
-            # 用 SkeletonRenderer 叠加骨骼（复用已有投影 + 绘制逻辑）
-            annotated = renderer.draw_skeleton(frame, joints_3d, cam_t, confidence=conf)
+            # 投影 3D → 2D 以计算人体 bbox
+            points_2d = bbox_renderer.project_3d_to_2d(joints_3d, cam_t)
+            xs = [p[0] for p in points_2d]
+            ys = [p[1] for p in points_2d]
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+
+            bw = max(x_max - x_min, 1)
+            bh = max(y_max - y_min, 1)
+            pad_x = bw * PAD_RATIO
+            pad_y = bh * PAD_RATIO
+
+            crop_x1 = max(0, int(x_min - pad_x))
+            crop_y1 = max(0, int(y_min - pad_y))
+            crop_x2 = min(w, int(x_max + pad_x))
+            crop_y2 = min(h, int(y_max + pad_y))
+
+            # 裁剪原帧
+            cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
+            if cropped.size == 0:
+                print(f"[Grid] ⚠️  帧 {frame_idx} 裁剪为空，跳过", file=sys.stderr)
+                continue
+
+            # 在裁剪帧上绘制骨骼（直接用已投影的 2D 点偏移到裁剪坐标系）
+            cw, ch = cropped.shape[1], cropped.shape[0]
+            shifted = [(px - crop_x1, py - crop_y1) for px, py in points_2d]
+            overlay = cropped.copy()
+            alpha = min(conf, 1.0)
+            for i, j in SMPL_SKELETON:
+                if i >= len(shifted) or j >= len(shifted):
+                    continue
+                part = BONE_PART_MAP.get((i, j), "torso")
+                color = BONE_COLORS.get(part, (200, 200, 200))
+                cv2.line(overlay, shifted[i], shifted[j], color, 2, cv2.LINE_AA)
+            for pt_idx, pt in enumerate(shifted):
+                color = (0, 255, 255) if pt_idx < 15 else (255, 255, 0)
+                cv2.circle(overlay, pt, 3, color, -1, cv2.LINE_AA)
+            annotated = cv2.addWeighted(overlay, alpha, cropped, 1 - alpha, 0)
 
             # 添加阶段标签（白字黑底半透明条）
             label = labels[idx] if idx < len(labels) else f"关键帧 {idx + 1}"
             overlay = annotated.copy()
-            cv2.rectangle(overlay, (0, 0), (w, 56), (0, 0, 0), -1)
+            cv2.rectangle(overlay, (0, 0), (cw, 56), (0, 0, 0), -1)
             annotated = cv2.addWeighted(overlay, 0.55, annotated, 0.45, 0)
             cv2.putText(annotated, label, (20, 38),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
                         cv2.LINE_AA)
 
+            cropped_frames.append((annotated, label))
+
+        if not cropped_frames:
+            return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+        # ---- 第二遍：统一画布尺寸 ----
+        # 按目标高度等比缩放每张图，宽度按比例；然后 pad 到最大宽度
+        max_canvas_w = 0
+        resized = []
+        for img, label in cropped_frames:
+            ih, iw = img.shape[:2]
+            scale = TARGET_H / ih
+            new_w = int(iw * scale)
+            scaled = cv2.resize(img, (new_w, TARGET_H),
+                                interpolation=cv2.INTER_AREA)
+            max_canvas_w = max(max_canvas_w, new_w)
+            resized.append((scaled, label))
+
+        canvas_w = max_canvas_w
+
+        for idx, (img, label) in enumerate(resized):
+            ih, iw = img.shape[:2]
+            if iw < canvas_w:
+                # 居中放置，两侧填黑
+                canvas = np.zeros((TARGET_H, canvas_w, 3), dtype=np.uint8)
+                x_off = (canvas_w - iw) // 2
+                canvas[:, x_off:x_off + iw] = img
+            else:
+                canvas = img
+
             # 保存 JPEG（质量 92%）
             filename = f"grid_{idx + 1:02d}.jpg"
             filepath = output_dir / filename
-            cv2.imwrite(str(filepath), annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            cv2.imwrite(str(filepath), canvas, [cv2.IMWRITE_JPEG_QUALITY, 92])
 
             # 检查文件大小（硬约束 200KB）
             file_size = filepath.stat().st_size
             if file_size > 200 * 1024:
-                # 降级质量重试
-                cv2.imwrite(str(filepath), annotated, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                cv2.imwrite(str(filepath), canvas, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 print(f"[Grid] {filename} 超 200KB ({file_size // 1024}KB)，"
                       f"降至 Q75 ({filepath.stat().st_size // 1024}KB)")
 
             grid_images.append(filename)
             grid_labels.append(label)
-            print(f"[Grid] ✅ {filename}: {label} (帧 {frame_idx})")
+            print(f"[Grid] ✅ {filename}: {label} ({canvas_w}x{TARGET_H})")
 
     finally:
         cap.release()
@@ -1542,9 +1618,23 @@ def _process_video_impl(stack, input_path, output_dir, device,
 
     renderer = SkeletonRenderer(width, height, focal_length=extractor.focal_length,
                                 image_size=extractor.image_size)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # [Fix #61] 视频编码改为 web 兼容：mp4v (MPEG-4 Part 2) 不被现代浏览器支持，
+    # 导致 <video> 显示黑屏。优先尝试 H.264 (avc1)，不可用时回退 MJPEG (mjpg)。
     video_out_path = output_path / "demo_output.mp4"
-    writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
+    fourcc, writer = None, None
+    for codec_tag, codec_label in [("avc1", "H.264"), ("mjpg", "MJPEG")]:
+        _f = cv2.VideoWriter_fourcc(*codec_tag)
+        _w = cv2.VideoWriter(str(video_out_path), _f, fps, (width, height))
+        if _w.isOpened():
+            fourcc, writer = _f, _w
+            print(f"[Video] 使用 {codec_label} ({codec_tag}) 编码输出视频")
+            break
+        _w.release()
+    if writer is None:
+        # 最后兜底：原始 mp4v（浏览器可能不支持，但至少产出文件）
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
+        print("[Video] ⚠️  H.264/MJPEG 均不可用，回退 mp4v（浏览器可能无法播放）")
     stack.callback(writer.release)
 
     cap2 = cv2.VideoCapture(str(input_path))
@@ -1606,16 +1696,30 @@ def _process_video_impl(stack, input_path, output_dir, device,
     else:
         pose_info = {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
 
-    # ---- SMPL Mesh 计算（仅关键帧，最多 4 帧）----
-    mesh_result = extractor.compute_mesh_for_keyframes(keyframes)
+    # ---- SMPL Mesh 计算（均匀采样关键帧，覆盖整段动画）----
+    # [Fix #61] 旧实现只取 keyframes[:4]（前 4 帧），导致 mesh 仅在动画开头
+    # 极短时间段有数据，其余时间静止不动。改为从全部帧中均匀采样，使 mesh
+    # 动画覆盖整段视频。上限 16 帧（SMPL forward 每帧 ~50-100ms，16 帧 <2s）。
+    MESH_FRAME_BUDGET = 16
+    n_total_kf = len(keyframes)
+    if n_total_kf > MESH_FRAME_BUDGET:
+        _mesh_sample = np.linspace(0, n_total_kf - 1, MESH_FRAME_BUDGET, dtype=int).tolist()
+        mesh_keyframes = [keyframes[i] for i in _mesh_sample]
+    else:
+        mesh_keyframes = keyframes
+    mesh_result = extractor.compute_mesh_for_keyframes(mesh_keyframes)
     if mesh_result["has_mesh"]:
         print(f"[Mesh] ✓ 计算完成：{len(mesh_result['mesh_vertices'])} 帧 × "
               f"{mesh_result['mesh_vertices_per_frame']} 顶点, "
               f"{len(mesh_result['faces'])} 面")
-        # 将 mesh_vertices 写入各关键帧
-        for idx_kf, kf in enumerate(keyframes):
-            kf["mesh_vertices"] = (mesh_result["mesh_vertices"][idx_kf]
-                                   if idx_kf < len(mesh_result["mesh_vertices"]) else [])
+        # 将 mesh_vertices 写入对应的关键帧（按采样索引映射回去）
+        if n_total_kf > MESH_FRAME_BUDGET:
+            for sample_i, mesh_verts in zip(_mesh_sample, mesh_result["mesh_vertices"]):
+                keyframes[sample_i]["mesh_vertices"] = mesh_verts
+        else:
+            for idx_kf, kf in enumerate(keyframes):
+                kf["mesh_vertices"] = (mesh_result["mesh_vertices"][idx_kf]
+                                       if idx_kf < len(mesh_result["mesh_vertices"]) else [])
     else:
         print("[Mesh] 无 mesh（fallback 模式或计算失败）")
 

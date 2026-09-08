@@ -153,7 +153,6 @@ function SkeletonRig({
   timeIndex: ReturnType<typeof buildTimeIndex>;
 }) {
   const buffer = useRef<Float32Array>(new Float32Array(JOINT_COUNT * 3));
-  const meshBuf = useRef<Float32Array>(new Float32Array(MESH_VERTEX_COUNT * 3));
   const jointRefs = useRef<Array<THREE.Mesh | null>>([]);
   const boneRefs = useRef<Array<THREE.Mesh | null>>([]);
 
@@ -163,93 +162,10 @@ function SkeletonRig({
   const tmpMid = useMemo(() => new THREE.Vector3(), []);
   const UP = useMemo(() => new THREE.Vector3(0, 1, 0), []);
 
-  // 平滑补偿因子：避免正视/侧视之间跳变
-  const smoothBlend = useRef(0);
-
-  // ── 透视宽度补偿常量 ──────────────────────────────────────────────
-  const PELVIS = 0, LEFT_HIP = 2, RIGHT_HIP = 5;
-  const NECK = 12, LEFT_SHOULDER = 13, RIGHT_SHOULDER = 14, HEAD = 15;
-  const LEFT_ELBOW = 16, RIGHT_ELBOW = 17;
-  const LEFT_WRIST = 18, RIGHT_WRIST = 19;
-  const LEFT_KNEE = 1, RIGHT_KNEE = 4;
-  const LEFT_ANKLE = 7, RIGHT_ANKLE = 10;
-
-  /** 对单侧下肢关节的 X 偏移做宽度补偿（相对 pelvis） */
-  const scaleLowerX = (
-    buf: Float32Array,
-    pelvisX: number,
-    hipIdx: number, kneeIdx: number, ankleIdx: number, s: number,
-  ) => {
-    buf[hipIdx * 3] = pelvisX + (buf[hipIdx * 3] - pelvisX) * s;
-    buf[kneeIdx * 3] = pelvisX + (buf[kneeIdx * 3] - pelvisX) * s;
-    buf[ankleIdx * 3] = pelvisX + (buf[ankleIdx * 3] - pelvisX) * s;
-  };
-
   useFrame(() => {
     const ms = timeline.getMs();
     sampleJoints(timeIndex, ms, buffer.current);
-    sampleMeshVertices(timeIndex, ms, meshBuf.current);
     const buf = buffer.current;
-    const mb = meshBuf.current;
-
-    // ── 透视宽度补偿 ────────────────────────────────────────────────
-    // 从 mesh 顶点包围盒计算整体宽度
-    let meshXMin = Infinity, meshXMax = -Infinity;
-    for (let k = 0; k < MESH_VERTEX_COUNT; k++) {
-      const x = mb[k * 3];
-      if (x < meshXMin) meshXMin = x;
-      if (x > meshXMax) meshXMax = x;
-    }
-    const meshWidth = meshXMax - meshXMin;
-
-    // 骨架肩宽 & 髋宽
-    const skShoulderW = Math.abs(buf[LEFT_SHOULDER * 3] - buf[RIGHT_SHOULDER * 3]);
-    const skHipW = Math.abs(buf[LEFT_HIP * 3] - buf[RIGHT_HIP * 3]);
-
-    // 经验比例：肩宽 ≈ 体宽 30 %，髋宽 ≈ 体宽 22 %
-    const rawSS = meshWidth > 0.01 && skShoulderW > 0.01
-      ? (meshWidth * 0.3) / skShoulderW : 1;
-    const rawHS = meshWidth > 0.01 && skHipW > 0.01
-      ? (meshWidth * 0.22) / skHipW : 1;
-
-    // Clamp 避免极端值
-    const shoulderScale = Math.max(0.7, Math.min(1.6, rawSS));
-    const hipScale = Math.max(0.7, Math.min(1.6, rawHS));
-
-    // 朝向感知：spine 向量（neck − pelvis）与 Y 轴夹角
-    const spineX = buf[NECK * 3] - buf[PELVIS * 3];
-    const spineY = buf[NECK * 3 + 1] - buf[PELVIS * 3 + 1];
-    const spineZ = buf[NECK * 3 + 2] - buf[PELVIS * 3 + 2];
-    const spineLen = Math.sqrt(spineX * spineX + spineY * spineY + spineZ * spineZ);
-    const angleDeg = spineLen > 1e-6
-      ? Math.acos(Math.min(1, Math.max(-1, spineY / spineLen))) * (180 / Math.PI)
-      : 0;
-
-    // > 60° 视为侧视，线性过渡 60°→80°
-    const rawBlend = angleDeg <= 60 ? 0
-      : angleDeg >= 80 ? 1
-      : (angleDeg - 60) / 20;
-
-    // 指数平滑，防止帧间跳变
-    smoothBlend.current += (rawBlend - smoothBlend.current) * 0.15;
-    const blend = smoothBlend.current;
-
-    if (blend > 0.005) {
-      const sS = 1 + (shoulderScale - 1) * blend;
-      const sH = 1 + (hipScale - 1) * blend;
-
-      // 肩部相关关节：相对 neck X 缩放
-      const neckX = buf[NECK * 3];
-      for (const idx of [LEFT_SHOULDER, RIGHT_SHOULDER, HEAD, LEFT_ELBOW, RIGHT_ELBOW, LEFT_WRIST, RIGHT_WRIST]) {
-        buf[idx * 3] = neckX + (buf[idx * 3] - neckX) * sS;
-      }
-
-      // 髋部相关关节（含膝、踝）：相对 pelvis X 缩放
-      const pelvisX = buf[PELVIS * 3];
-      scaleLowerX(buf, pelvisX, LEFT_HIP, LEFT_KNEE, LEFT_ANKLE, sH);
-      scaleLowerX(buf, pelvisX, RIGHT_HIP, RIGHT_KNEE, RIGHT_ANKLE, sH);
-    }
-    // ── 补偿结束 ────────────────────────────────────────────────────
 
     for (let i = 0; i < JOINT_COUNT; i++) {
       const mesh = jointRefs.current[i];
