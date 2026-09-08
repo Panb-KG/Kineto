@@ -1,84 +1,135 @@
 /**
  * components/VideoCompare.tsx
  * ─────────────────────────────────────────────────────────────────────────
- * 双视频同步对比：左侧原始输入视频，右侧解析后 demo 视频。
- * 播放/暂停/跳转同步，响应式布局（移动端上下排列）。
+ * 模型动图 + 解析动图同步播放（已移除原始视频展示）。
+ *
+ * 导出两个组件，由父组件通过 useVideoSync Hook 统一管理同步：
+ *   - VideoCompare   → 主模型动图（demo_output.mp4），带播放控制
+ *   - AnalysisVideo  → 解析动图（input.mp4），缩小版，放侧边栏元数据下方
+ *
+ * 布局根据视频宽高比自适应：横屏视频宽幅展示，竖屏视频收窄。
  */
 
 "use client";
 
-import { useRef, useCallback } from "react";
+import { useCallback, useState, type MutableRefObject } from "react";
 import { API_BASE } from "../lib/api";
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 主模型动图
+ * ════════════════════════════════════════════════════════════════════════ */
 
 interface VideoCompareProps {
   jobId: string;
+  modelRef: MutableRefObject<HTMLVideoElement | null>;
+  playing: boolean;
+  togglePlay: () => void;
+  onModelPlay: () => void;
+  onModelPause: () => void;
+  onModelSeek: () => void;
+  onModelTimeUpdate: () => void;
+  onModelEnded: () => void;
 }
 
-export default function VideoCompare({ jobId }: VideoCompareProps) {
-  const leftRef = useRef<HTMLVideoElement>(null);
-  const rightRef = useRef<HTMLVideoElement>(null);
-  const syncing = useRef(false);
+export default function VideoCompare({
+  jobId,
+  modelRef,
+  playing,
+  togglePlay,
+  onModelPlay,
+  onModelPause,
+  onModelSeek,
+  onModelTimeUpdate,
+  onModelEnded,
+}: VideoCompareProps) {
+  const videoUrl = `${API_BASE}/jobs/${jobId}/demo_output.mp4`;
+  const [orientation, setOrientation] = useState<"landscape" | "portrait">(
+    "landscape",
+  );
 
-  const syncTime = useCallback(
-    (source: HTMLVideoElement, target: HTMLVideoElement | null) => {
-      if (syncing.current || !target) return;
-      syncing.current = true;
-      target.currentTime = source.currentTime;
-      requestAnimationFrame(() => {
-        syncing.current = false;
-      });
+  const handleLoadedMeta = useCallback(
+    (e: React.SyntheticEvent<HTMLVideoElement>) => {
+      const v = e.currentTarget;
+      setOrientation(v.videoWidth > v.videoHeight ? "landscape" : "portrait");
     },
     [],
   );
-
-  const handlePlay = useCallback(
-    (source: HTMLVideoElement, target: HTMLVideoElement | null) => {
-      if (target) {
-        target.currentTime = source.currentTime;
-        target.play();
-      }
-    },
-    [],
-  );
-
-  const handlePause = useCallback((target: HTMLVideoElement | null) => {
-    if (target) target.pause();
-  }, []);
-
-  const inputUrl = `${API_BASE}/jobs/${jobId}/input.mp4`;
-  const demoUrl = `${API_BASE}/jobs/${jobId}/demo_output.mp4`;
 
   return (
-    <section className="video-compare" aria-label="视频对比">
-      <h2 className="section-label">视频对比 · Video Compare</h2>
-      <div className="video-compare__pair">
-        <div className="video-compare__slot">
-          <span className="video-compare__label">原始视频</span>
-          <video
-            ref={leftRef}
-            src={inputUrl}
-            controls
-            preload="metadata"
-            onPlay={() => handlePlay(leftRef.current!, rightRef.current)}
-            onPause={() => handlePause(rightRef.current)}
-            onSeeked={() => syncTime(leftRef.current!, rightRef.current)}
-            className="video-compare__video"
-          />
-        </div>
-        <div className="video-compare__slot">
-          <span className="video-compare__label">解析视频</span>
-          <video
-            ref={rightRef}
-            src={demoUrl}
-            controls
-            preload="metadata"
-            onPlay={() => handlePlay(rightRef.current!, leftRef.current)}
-            onPause={() => handlePause(leftRef.current)}
-            onSeeked={() => syncTime(rightRef.current!, leftRef.current)}
-            className="video-compare__video"
-          />
-        </div>
+    <div
+      className={`vc-model vc-model--${orientation}`}
+      data-orientation={orientation}
+    >
+      <div className="vc-model__head">
+        <h2 className="section-label">模型动图 · Model Output</h2>
+        <button
+          className="vc-play-btn"
+          onClick={togglePlay}
+          aria-label={playing ? "暂停" : "播放"}
+        >
+          {playing ? (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+              <rect x="2" y="1" width="3.5" height="12" rx="1" />
+              <rect x="8.5" y="1" width="3.5" height="12" rx="1" />
+            </svg>
+          ) : (
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
+              <path d="M3 1.5v11l9-5.5z" />
+            </svg>
+          )}
+          <span>{playing ? "暂停" : "播放"}</span>
+        </button>
       </div>
-    </section>
+      <video
+        ref={modelRef}
+        src={videoUrl}
+        preload="metadata"
+        onLoadedMetadata={handleLoadedMeta}
+        onPlay={onModelPlay}
+        onPause={onModelPause}
+        onSeeked={onModelSeek}
+        onTimeUpdate={onModelTimeUpdate}
+        onEnded={onModelEnded}
+        className="vc-model__video"
+        playsInline
+      />
+    </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * 解析动图（缩小版，侧边栏内嵌）
+ * ════════════════════════════════════════════════════════════════════════ */
+
+export function AnalysisVideo({
+  jobId,
+  analysisRef,
+  onAnalysisPlay,
+  onAnalysisPause,
+  onAnalysisSeek,
+}: {
+  jobId: string;
+  analysisRef: MutableRefObject<HTMLVideoElement | null>;
+  onAnalysisPlay: () => void;
+  onAnalysisPause: () => void;
+  onAnalysisSeek: () => void;
+}) {
+  const videoUrl = `${API_BASE}/jobs/${jobId}/input.mp4`;
+
+  return (
+    <div className="vc-analysis">
+      <span className="vc-analysis__label">解析输入 · Analysis Input</span>
+      <video
+        ref={analysisRef}
+        src={videoUrl}
+        preload="metadata"
+        muted
+        playsInline
+        onPlay={onAnalysisPlay}
+        onPause={onAnalysisPause}
+        onSeeked={onAnalysisSeek}
+        className="vc-analysis__video"
+      />
+    </div>
   );
 }

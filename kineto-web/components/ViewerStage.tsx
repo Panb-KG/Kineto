@@ -15,9 +15,11 @@ import dynamic from "next/dynamic";
 import MetadataPanel from "./MetadataPanel";
 import TimelineControls from "./TimelineControls";
 import KeyframeCards from "./KeyframeCards";
+import VideoCompare, { AnalysisVideo } from "./VideoCompare";
 import { loadPoseData, type LoadedPoseData } from "../lib/poseData";
 import { getJob } from "../lib/api";
 import { useTimeline } from "../lib/useTimeline";
+import { useVideoSync } from "../lib/useVideoSync";
 
 const SkeletonViewer = dynamic(() => import("./SkeletonViewer"), {
   ssr: false,
@@ -29,9 +31,7 @@ const MeshViewer = dynamic(() => import("./MeshViewer"), {
   loading: () => <div className="viewer-skeleton-loading">初始化 Mesh 引擎…</div>,
 });
 
-const VideoCompare = dynamic(() => import("./VideoCompare"), {
-  ssr: false,
-});
+
 
 const CombinedViewer = dynamic(() => import("./CombinedViewer"), {
   ssr: false,
@@ -184,6 +184,9 @@ function ReadyStage({
   const keyframes = useMemo(() => data.keyframes, [data]);
   const { timeline, playing, durationMs, toggle } = useTimeline(keyframes, true);
 
+  // 视频同步 Hook：模型动图与解析动图联动
+  const videoSync = useVideoSync();
+
   // 检查是否有 mesh 数据
   const hasMesh = data.metadata.has_mesh === true && 
     data.mesh_faces !== undefined && 
@@ -259,6 +262,21 @@ function ReadyStage({
         />
       )}
 
+      {/* 模型动图：全宽横幅展示 */}
+      {source === "api" && jobId && (
+        <VideoCompare
+          jobId={jobId}
+          modelRef={videoSync.modelRef}
+          playing={videoSync.playing}
+          togglePlay={videoSync.togglePlay}
+          onModelPlay={videoSync.onModelPlay}
+          onModelPause={videoSync.onModelPause}
+          onModelSeek={videoSync.onModelSeek}
+          onModelTimeUpdate={videoSync.onModelTimeUpdate}
+          onModelEnded={videoSync.onModelEnded}
+        />
+      )}
+
       {/* 下半部分：3D 视图 + 控制条 + 元数据 */}
       <section className="viewer-section" aria-label="3D 交互视图">
         <div className="viewer-frame">
@@ -323,13 +341,18 @@ function ReadyStage({
             source={source}
             fallbackReason={fallbackReason}
           />
+          {/* 解析动图：缩小版，置于元数据面板下方 */}
+          {source === "api" && jobId && (
+            <AnalysisVideo
+              jobId={jobId}
+              analysisRef={videoSync.analysisRef}
+              onAnalysisPlay={videoSync.onAnalysisPlay}
+              onAnalysisPause={videoSync.onAnalysisPause}
+              onAnalysisSeek={videoSync.onAnalysisSeek}
+            />
+          )}
         </div>
       </section>
-
-      {/* 视频对比：仅当 job 完成且来源为 API 时显示 */}
-      {source === "api" && jobId && (
-        <VideoCompare jobId={jobId} />
-      )}
     </>
   );
 }
