@@ -1583,9 +1583,17 @@ def _process_video_impl(stack, input_path, output_dir, device,
 
     # ---- 第 4 步：生成四宫格教学图（关键帧截图 + 骨骼叠加）----
     grid_result = {"grid_images": [], "grid_labels": []}
+    # 从全部帧中均匀采样 4 个代表性关键帧（而非取前 4 个连续帧）
+    n_total = len(keyframes)
+    if n_total >= 4:
+        _sample_indices = np.linspace(0, n_total - 1, 4, dtype=int).tolist()
+        grid_keyframes = [keyframes[i] for i in _sample_indices]
+    else:
+        grid_keyframes = keyframes
+
     try:
         grid_result = _generate_grid_images(
-            str(input_path), keyframes, output_path,
+            str(input_path), grid_keyframes, output_path,
             focal_length=extractor.focal_length, image_size=extractor.image_size)
         print(f"[Grid] 生成 {len(grid_result['grid_images'])} 张教学图")
     except Exception as exc:
