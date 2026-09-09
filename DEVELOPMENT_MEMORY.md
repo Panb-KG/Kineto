@@ -59,6 +59,18 @@
 - **遗留已解决**（2026-09-09 晚，全程免 sudo，经 Tailscale 远程）：设备 `KINETO_CORS_ORIGINS` 原为 UTF-8 中文域名（浏览器 Origin 头发 punycode 不匹配）→ 更新为 punycode+UTF-8 双值；docker（`--pid=host --cap-add SYS_PTRACE --security-opt apparmor=unconfined`）TERM 主进程 → systemd `Restart=always` 自动拉起（PID 10394→18198）加载新代码；随后**真实 API 链路 E2E PASS**：POST /jobs → 71s → `state=done / 4dhumans / 0.9936`，job 产物首次含 `mesh_vertices`（16 帧），G14 断言 mean/max **0.000mm**。
 - **节奏贴合矛盾（规划输入）**：骨架 466 帧全量 60fps 插值，mesh 受 `MESH_FRAME_BUDGET=16` 限制仅 16 帧 → 叠加模式节奏必然脱节；全帧 mesh 需二进制通道（float32 JSON 约 150MB 不可行）。
 
+### 2026-09-09 P1 mesh 节奏贴合（全帧二进制交付，真机 E2E PASS）
+- **核心思路**：J_regressor 为线性映射 ⇒ 顶点相邻帧线性插值与 joints_3d 线性插值严格同步。故 mesh 改为**全帧** SMPL forward（不再 16 帧采样），顶点写独立二进制 `mesh_vertices.f32`（帧数×6890×3 float32 LE），JSON 仅引用不嵌入。
+- **引擎** `kineto_core.py`：`MESH_FRAME_BUDGET` 全帧化，预分配 `(F,6890,3)` float32 ndarray 直写避免数 GB 峰值；pelvis 锚点对齐保留（P0 遗产）；metadata 新增 `mesh_vertices_file`/`mesh_vertices_frames`/`mesh_vertices_per_frame` 三字段；JSON 体积 15MB→3.1MB。
+- **引擎** `api.py`：新增 `GET /jobs/{id}/mesh_vertices.f32`（X-API-Key 保护，走 `_serve_artifact`）。
+- **前端** `types.ts`/`api.ts`/`poseData.ts`：`MeshTrack` 接口 + `fetchMeshVerticesRaw`（校验字节数）+ `loadMeshTrack`（加载后预翻转 y→-y/z→-z，帧数须与 keyframes 1:1）。
+- **前端** `timeline.ts`：`sampleMeshVertices`/`computeMeshFraming` 双路径——有轨道时帧下标直取线性插值（与 `sampleJoints` 同一 `times`/`frac`，节奏严格同步）；无轨道回退旧 JSON 嵌入扫描（fixture 兼容）。
+- **前端** `CombinedViewer`/`MeshViewer`/`ViewerStage`：接入 `meshTrack`；`hasMesh` 改为「轨道或嵌入任一存在」。
+- **前端** `app/api/[...path]/route.ts`：白名单加入 `mesh_vertices.f32`（否则代理 404）。
+- **门禁** `check_ssot.py` G14：扩展二进制路径断言，`np.einsum("jv,fvc->fjc", j_reg, verts)` 全帧回归 joints 与 `keyframes.joints_3d` 比对。
+- **真机 E2E PASS**（job `d9ef1171...`，466 帧）：`mesh_vertices.f32` = 38,528,880 bytes（精确 466×6890×3×4）；G14 全帧断言 **mean/max 0.00mm PASS**；代理链 `/api/jobs/{id}/mesh_vertices.f32` 返回 200，MD5 与引擎直出 `36cb2e8d...` 完全一致；`tsc --noEmit` + `npm run lint`（补 `.eslintrc.json` + eslint@8）+ check_ssot 全过。
+- **部署说明**：引擎代码已 rsync 到设备并重启（需 sudo，因服务 User=kineto）；前端已 push `e6d7311` 触发 Zeabur 自动部署。
+
 ## 3. 核心信息速查（设备与服务）
 
 ### 访问方式
