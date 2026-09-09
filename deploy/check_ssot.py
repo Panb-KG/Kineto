@@ -19,6 +19,10 @@
 #   A3 SMPL_SKELETON   ：23 条 canonical 边，集合相同、无重复，
 #                        **必须含 (9,13)/(9,14)，且绝不含旧假边 (12,13)/(12,14)**
 #   A4 BONE_PART_MAP   ：键集合与部位归属逐一相同（左右臂链挂在 9→13/14 上）
+#   G14 mesh↔joints    ：产物 pose_data.json 中携带 mesh_vertices 的关键帧，
+#                        从顶点经 SMPL_J_REGRESSOR 回归的关节须与 joints_3d 重合
+#                        （容差 10mm；引擎 [P0 mesh↔joints 对齐] 后按构造 ≈0）。
+#                        无产物/无 mesh 帧时 SKIP，不阻塞其他闸门。
 #
 # 取值策略（低风险、可在任何环境跑）：
 #   SSOT 侧优先 `import skeleton_spec`（顺带触发其模块级自检 validate_self_consistency）；
@@ -48,6 +52,11 @@ from pathlib import Path
 
 NUM_JOINTS = 24
 COLLAR_L, COLLAR_R, SPINE3, NECK = 13, 14, 9, 12
+
+# G14：mesh 顶点 ↔ joints_3d 一致性容差（mm）。
+# 引擎 [P0 mesh↔joints 对齐] 后两者按构造精确重合（残差 0），浮点经 JSON 往返
+# 只有亚毫米误差；超过阈值说明产物由旧管线生成（未对齐）或被手工改动。
+_MESH_JOINTS_TOL_MM = 10.0
 
 _OK, _DRIFT, _INFO, _SKIP = "[OK]", "[DRIFT]", "[INFO]", "[SKIP]"
 
@@ -439,6 +448,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", default=None,
                     help="可选前端镜像清单（默认 <root>/kineto-web/lib/skeleton.manifest.json，存在即优先）")
     ap.add_argument("--engine-dir", default=None, help="引擎目录（默认 <root>/kineto-engine）")
+    ap.add_argument("--pose-data", default=None,
+                    help="G14 产物路径（默认自动探测 <engine-dir>/output_test|output_closed|output/pose_data.json）")
     args = ap.parse_args(argv)
 
     root = Path(args.repo_root).resolve()
@@ -520,6 +531,10 @@ def main(argv: list[str] | None = None) -> int:
     # --- skeleton_validator.py 迁移检查（G12 覆盖引擎侧第三份骨架常量副本）---
     check_skeleton_validator_migration(engine_dir, rep)
 
+    # --- G14：产物级 mesh 顶点 ↔ joints_3d 一致性（叠加模式贴合性闸门）---
+    pose_data = Path(args.pose_data) if args.pose_data else _find_pose_data_with_mesh(engine_dir)
+    check_mesh_joints_alignment(pose_data, engine_dir, rep)
+
     print("-" * 78)
     if rep.errors and not rep.drifts:
         print(f"==> G12/G8-SSOT 无法完成校验（{len(rep.errors)} 项解析/结构错误）")
@@ -537,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         print("    运行时首次推理前会重试加载 pkl 派生常量（BONE_LENGTH_BOUNDS / rest 骨长）。")
         return 3
     print("==> G12/G8-SSOT PASS：前端 skeleton.ts 与 SSOT skeleton_spec.py 完全一致"
-          "（含 skeleton_validator.py 迁移检查）")
+          "（含 skeleton_validator.py 迁移检查 + G14 mesh↔joints 一致性）")
     return 0
 
 
@@ -595,6 +610,92 @@ def check_skeleton_validator_migration(engine_dir: Path, rep: Report) -> None:
     if not any(_re.search(rf"^\s*{f}\s*=\s*[\[\{{]", src, _re.MULTILINE)
                for f in _FORBIDDEN_LOCAL_COPIES):
         rep.ok("A6 skeleton_validator.py 无本地骨架常量副本（SMPL_SKELETON/BONE_VALIDITY 已删除）")
+
+
+# -----------------------------------------------------------------------------
+# G14：产物级 mesh 顶点 ↔ joints_3d 一致性断言
+# -----------------------------------------------------------------------------
+def _find_pose_data_with_mesh(engine_dir: Path) -> Path | None:
+    """按 validate.sh G13 的约定探测产物（output_test 优先，其次 output_closed / output）。"""
+    for name in ("output_test", "output_closed", "output"):
+        p = engine_dir / name / "pose_data.json"
+        if p.exists():
+            return p
+    return None
+
+
+def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, rep: Report) -> None:
+    """G14：对产物 pose_data.json 断言 mesh 顶点与 joints_3d 同坐标（叠加模式贴合性）。
+
+    方法：对每个携带 mesh_vertices 的关键帧，用 SSOT 的 SMPL_J_REGRESSOR 从顶点
+    回归 24 关节，与交付 joints_3d 逐关节比较。引擎 [P0 mesh↔joints 对齐] 保证
+    两者按构造重合（残差 ≈0），故超阈值即判产物漂移（旧管线生成）。
+    无产物 / 无 mesh 帧 / J_regressor 不可用时 SKIP（不影响退出码）。
+    """
+    if pose_data_path is None:
+        rep.warn("G14 未找到产物 pose_data.json（output_test/output_closed/output 均缺失）→ SKIP")
+        return
+    if not pose_data_path.exists():
+        rep.warn(f"G14 产物不存在: {pose_data_path} → SKIP")
+        return
+
+    try:
+        sys.path.insert(0, str(engine_dir))
+        try:
+            spec_mod = importlib.import_module("skeleton_spec")
+            j_regressor = spec_mod.SMPL_J_REGRESSOR
+        finally:
+            try:
+                sys.path.remove(str(engine_dir))
+            except ValueError:
+                pass
+    except Exception as exc:                  # noqa: BLE001 - pkl/chumpy/numpy 不可用
+        rep.warn(f"G14 J_regressor 不可用（{type(exc).__name__}: {exc}）→ SKIP（需引擎 venv 运行）")
+        return
+
+    import numpy as np
+
+    try:
+        data = json.loads(pose_data_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        rep.error(f"G14 产物读取失败: {pose_data_path} ({exc})")
+        return
+
+    kfs = [k for k in data.get("keyframes", [])
+           if k.get("mesh_vertices") and len(k.get("joints_3d", [])) == NUM_JOINTS]
+    if not kfs:
+        rep.warn(f"G14 {pose_data_path.name} 无携带 mesh_vertices 的关键帧 → SKIP"
+                 f"（叠加模式贴合性未被本次校验覆盖；真机重生成产物后复验）")
+        return
+
+    j_reg = np.asarray(j_regressor, dtype=np.float64).reshape(NUM_JOINTS, -1)
+    max_err, mean_err, worst_frame = 0.0, 0.0, -1
+    checked = 0
+    for kf in kfs:
+        verts = np.asarray(kf["mesh_vertices"], dtype=np.float64)
+        if verts.ndim != 2 or verts.shape[1] != 3 or verts.shape[0] != j_reg.shape[1]:
+            rep.warn(f"G14 帧 {kf.get('frame_index')} mesh 顶点形状异常 {verts.shape} → 跳过该帧")
+            continue
+        fk = j_reg @ verts                                    # (24, 3)
+        ref = np.asarray(kf["joints_3d"], dtype=np.float64)
+        err_mm = np.linalg.norm(fk - ref, axis=1) * 1000.0
+        if err_mm.max() > max_err:
+            max_err, worst_frame = float(err_mm.max()), int(kf.get("frame_index", -1))
+        mean_err += float(err_mm.mean())
+        checked += 1
+
+    if checked == 0:
+        rep.warn("G14 无有效 mesh 帧（形状均异常）→ SKIP")
+        return
+
+    mean_err /= checked
+    if max_err <= _MESH_JOINTS_TOL_MM:
+        rep.ok(f"G14 mesh↔joints 一致：{checked} 帧 mesh 帧全部在容差内"
+               f"（mean {mean_err:.2f}mm / max {max_err:.2f}mm ≤ {_MESH_JOINTS_TOL_MM}mm）")
+    else:
+        rep.drift(f"G14 mesh↔joints 错位：max {max_err:.2f}mm（帧 {worst_frame}）"
+                  f"> 容差 {_MESH_JOINTS_TOL_MM}mm —— 产物由未对齐的旧管线生成，"
+                  f"叠加模式骨架与 mesh 将偏离 ~{max_err:.0f}mm，须重跑管线重新生成产物")
 
 
 if __name__ == "__main__":

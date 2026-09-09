@@ -48,6 +48,17 @@
 - 验收基线更新：质量分 0.9936（原 0.6726，因 `clip_info` 跨轮累积后更诚实反映约束违反程度）
 - 部署踩坑：`/srv/kineto/` 目录权限 750→755（juxin 无 traverse 权限导致 validate.sh G3 403）；旧视频 `/opt/kineto/kineto-engine/input_video.mp4` 需删除（validate.sh 优先探测该路径但不在 inbox 内）
 
+### 2026-09-09 P0 mesh↔joints 对齐 + smplx 形状 bug 修复（本地验证通过，待真机复验）
+- **根因定位**：SMPL forward 输出在模型空间，交付 joints_3d 在原始帧坐标系，两者相差每帧恒定平移（Kabsch 验证：去 t 后残差=0，|t|≈0.31m）→ 叠加模式 mesh 与骨架错位 ~300mm。
+- **引擎修复**：`kineto_core.py` `compute_mesh_for_keyframes` 增加 pelvis 锚点平移（`t_align = joints_3d[0] - (J_regressor @ vertices)[0]`），mesh 顶点对齐到交付坐标系；J_regressor 线性性保证中间插值帧按构造贴合。
+- **顺带实锤隐藏 bug**：smplx 0.1.28 `pose2rot=False` 要求 `global_orient` 为 `(B,1,3,3)`，引擎原传 `(B,3,3)` 会在 `torch.cat` 抛 RuntimeError → mesh 路径被宽 except 吞掉、整体静默降级 `has_mesh: False`（历史产物均无 mesh_vertices 的根因）。已修为 `reshape(1, 1, 3, 3)`。
+- **前端**：删除 `CombinedViewer.tsx` 的 `JOINT_NUDGE` 手调偏移（引擎已数学对齐，无需补偿）。
+- **门禁**：`check_ssot.py` 新增 **G14**（产物 mesh 顶点经 J_regressor 回归须与 joints_3d 重合，容差 10mm；无 mesh 帧时 SKIP）。
+- **本地数值复验 PASS**：12/466 帧采样，修复前最大错位 327.4mm → 修复后残差 0.0003mm；`tsc --noEmit` + G12/G14 闸门通过。
+- **真机复验 PASS**（2026-09-09）：rsync 两文件到设备 → 离线 CLI 重生成 `output_test`（466 帧、16 帧 mesh、`[Mesh] ✓ 计算完成`——修复前此处静默失败；质量分 0.9936 无回归）→ G14 断言 mean/max **0.000mm** PASS。设备上无 kineto-web 时 G12 提前 SKIP，G14 需单独脚本（用 `skeleton_spec.SMPL_J_REGRESSOR` 纯 numpy 即可，无需构建 SMPLLayer）。
+- **遗留已解决**（2026-09-09 晚，全程免 sudo，经 Tailscale 远程）：设备 `KINETO_CORS_ORIGINS` 原为 UTF-8 中文域名（浏览器 Origin 头发 punycode 不匹配）→ 更新为 punycode+UTF-8 双值；docker（`--pid=host --cap-add SYS_PTRACE --security-opt apparmor=unconfined`）TERM 主进程 → systemd `Restart=always` 自动拉起（PID 10394→18198）加载新代码；随后**真实 API 链路 E2E PASS**：POST /jobs → 71s → `state=done / 4dhumans / 0.9936`，job 产物首次含 `mesh_vertices`（16 帧），G14 断言 mean/max **0.000mm**。
+- **节奏贴合矛盾（规划输入）**：骨架 466 帧全量 60fps 插值，mesh 受 `MESH_FRAME_BUDGET=16` 限制仅 16 帧 → 叠加模式节奏必然脱节；全帧 mesh 需二进制通道（float32 JSON 约 150MB 不可行）。
+
 ## 3. 核心信息速查（设备与服务）
 
 ### 访问方式
@@ -98,10 +109,20 @@
 10. **引擎 job 状态字段是 `state` 不是 `status`**；JSON 模式 `video_path` 必须位于 `KINETO_INBOX` 内。
 11. **`pkill -f` 会匹配自身命令行**（SSH 复合命令中 pkill 关键词出现在同一命令串导致自杀）：pkill 模式用 `[x]` 方括号断言或拆分命令。
 12. **bluetoothctl 非交互配对**：单次/管道模式（`(echo scan on; sleep 6; echo pair <MAC>; sleep 120; echo quit) | bluetoothctl`），agent 用 `KeyboardDisplay`，passkey 由主机端显示、在物理键盘输入；配对后 `trust` 以便自动回连。
+13. **3D 姿态必须与原视频一致——禁止前端 spine 旋转校正**：引擎 `_extract_4dhumans_rotated` 已将 3D 坐标逆旋转回原始帧坐标系，前端不得再做 spine-to-Y 对齐。若原视频中人是躺着的，3D 模型也应显示为躺着。多层旋转叠加会导致姿态翻转/错位，此问题已反复出现多次。
+14. **4D-Humans 旋转处理流程（硬约束）**：4D-Humans 模型按人体直立姿态设计，处理非直立输入时必须遵循三步流程：
+    - **输入旋转**：检测横卧姿态（bbox 宽≥高）→ 旋转帧 90° 让人体"直立"
+    - **模型推理**：在旋转后的帧上运行 4D-Humans，得到直立坐标系下的 3D 结果
+    - **输出复原**：将 joints_3d、cam_t、global_orient 逆旋转回原始帧坐标系
+    - 前端直接渲染复原后的坐标，**禁止**任何额外旋转。原视频是什么姿态，3D 就显示什么姿态。
+15. **相机坐标→世界坐标转换（硬约束）**：引擎输出相机坐标系（X 右，Y 下，Z 向前），Three.js 使用世界坐标系（X 右，Y 上，Z 向后）。前端在 `computeFraming`/`computeMeshFraming` 中必须应用转换：`y → -y`，`z → -z`。否则模型会上下颠倒、前后反向。
+16. **smplx 0.1.28 `pose2rot=False` 形状约定**：`global_orient` 必须是 `(B,1,3,3)`（与 `body_pose` 的 `(B,23,3,3)` 同维才能 `torch.cat`），传 `(B,3,3)` 抛 RuntimeError；引擎 mesh 路径宽 except 会把这类错误吞成 `has_mesh: False` 静默降级——mesh 相关改动必须用真产物验证 G14，不能只看 job state=done。
+17. **设备离线跑引擎 CLI 需 `HOME=/srv/kineto`**：HMR2 `get_config` 的 cachedir 依赖 HOME 解析到 `~/.cache/4DHumans`（服务以 kineto 用户跑、HOME=/srv/kineto）；juxin 直接跑会 `FileNotFoundError: …/model_config.yaml`。离线复现：`cd /opt/kineto/kineto-engine && HOME=/srv/kineto /opt/kineto/venv/bin/python3 kineto_core.py -i <video> -o <dir>`（juxin 在 video/render 组，XPU 可用；output_test 归 juxin 可写）。
+18. **无 sudo 远程运维 AI BOX（juxin sudo 需密码）**：juxin 在 `docker` 组 = 等价 root。读改 root 文件：`docker run --rm --user 0 --entrypoint sh -v /etc/kineto:/e <镜像> -c '…'`（mofang 镜像内置非 root USER，必须显式 `--user 0`；容器内无宿主组名，chown 用数字 GID，`getent group kineto` 查）。重启 systemd 服务：`docker run --rm --pid=host --user 0 --cap-add SYS_PTRACE --security-opt apparmor=unconfined <镜像> kill -TERM <主进程PID>` → `Restart=always` 自动拉起（默认 AppArmor docker-default 拦跨命名空间 signal，必须 unconfined + SYS_PTRACE）。改 env 文件后注意恢复 `chown root:kineto`（GID 982）+ `chmod 640`。
 
 ## 5. 待办 / 后续方向
 
-- **Zeabur 前端生产部署**：公网入口已打通（Funnel），下一步在 Zeabur 项目设环境变量 `ENGINE_API_BASE=https://aibox.tail6791a3.ts.net` + `KINETO_API_KEY=<key>`，然后 git push 部署前端，验证浏览器→Zeabur→Funnel→引擎全链路。
+- **Zeabur 前端生产部署**：前端域名已定案 `https://kineto.标智云.中国`（punycode `kineto.xn--9kqt69c97a.xn--fiqs8s`）。设备侧 `KINETO_CORS_ORIGINS` 已更新为 punycode+UTF-8 双值（2026-09-09）。剩余待办全在 Zeabur 控制台：绑定自定义域名（自动 TLS）+ 阿里云子域 CNAME 到 Zeabur 目标 + 环境变量 `ENGINE_API_BASE=https://aibox.tail6791a3.ts.net` + `KINETO_API_KEY=<key>`，git push 部署后验证浏览器→域名→Zeabur→Funnel→引擎全链路。
 - **自定义域名**（可选）：若品牌需要 `kineto.标智云.中国` 而非 `ts.net`，Tailscale 支持给节点配 CNAME（需 Tailscale Pro 或以上）；或保留 cloudflared 备用方案。
 - **备用公网方案**：cloudflared 已装（apt 源保留），如需临时公网 URL：`systemctl enable --now cloudflared-quick`，地址用 `journalctl -u cloudflared-quick | grep trycloudflare` 查（重启会变）。
 - K380 三个蓝牙通道中仅一个绑到本机，其余通道可另连 Mac 等设备。

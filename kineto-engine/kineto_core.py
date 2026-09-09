@@ -406,8 +406,10 @@ class PoseExtractor:
                 global_orient_aa = np.array(smpl_thetas[:3], dtype=np.float32)
                 body_pose_aa = np.array(smpl_thetas[3:72], dtype=np.float32)
 
-                # 轴角 → 旋转矩阵
-                global_orient_mat = Rotation.from_rotvec(global_orient_aa).as_matrix().reshape(1, 3, 3)
+                # 轴角 → 旋转矩阵（smplx 0.1.28 pose2rot=False 要求 global_orient
+                # 为 (B,1,3,3) 与 body_pose 的 (B,23,3,3) 同维拼接，传 (B,3,3) 会
+                # 在 torch.cat 处 RuntimeError → mesh 整体静默降级）
+                global_orient_mat = Rotation.from_rotvec(global_orient_aa).as_matrix().reshape(1, 1, 3, 3)
                 body_pose_mat = Rotation.from_rotvec(body_pose_aa.reshape(-1, 3)).as_matrix().reshape(1, 23, 3, 3)
 
                 # 转 torch
@@ -420,6 +422,21 @@ class PoseExtractor:
                     smpl_out = self.model.smpl(betas=betas_t, body_pose=bp_t, global_orient=go_t, pose2rot=False)
 
                 vertices = smpl_out.vertices[0].cpu().numpy()  # (6890, 3)
+
+                # [P0 mesh↔joints 对齐] SMPL forward 输出在模型空间（pelvis 位于
+                # R(global_orient)@rest 偏移处），而交付的 joints_3d 位于原始帧
+                # 坐标系（refine/重算 thetas 后两者相差一个**每帧恒定平移**，实测
+                # |t|≈0.31-0.32m，各关节 std=0、去 t 后残差=0）。以 pelvis 关节
+                # （canonical 序 0）为锚点把 mesh 平移到 joints_3d 坐标系，使叠加
+                # 模式下骨架与 mesh 位置精确重合。J_regressor 与 _solve_hmr2 的
+                # canonical 关节同源，回归数学一致，故对齐是精确而非近似。
+                joints_ref = kf.get("joints_3d")
+                if joints_ref is not None and len(joints_ref) == 24:
+                    j_reg = self.model.smpl.J_regressor.detach().cpu().numpy().reshape(24, 6890)
+                    fk_joints = j_reg @ vertices                      # (24, 3) 模型空间
+                    t_align = np.asarray(joints_ref[0], dtype=np.float32) - fk_joints[0]
+                    vertices = vertices + t_align[np.newaxis, :]
+
                 all_vertices.append(vertices.tolist())
 
             return {
