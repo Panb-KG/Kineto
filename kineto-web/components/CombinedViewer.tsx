@@ -22,10 +22,8 @@ import type { PoseTimeline } from "../lib/timeline";
 import {
   buildTimeIndex,
   computeMeshFraming,
-  computeSpineOrientation,
   sampleMeshVertices,
   sampleJoints,
-  applyRotationToJoints,
 } from "../lib/timeline";
 import {
   SMPL_JOINT_NAMES,
@@ -72,7 +70,6 @@ function SMPLMesh({
   offset,
   scale,
   timeIndex,
-  spineQuat,
 }: {
   keyframes: Keyframe[];
   faces: Vec3[];
@@ -81,7 +78,6 @@ function SMPLMesh({
   offset: [number, number, number];
   scale: number;
   timeIndex: ReturnType<typeof buildTimeIndex>;
-  spineQuat: [number, number, number, number];
 }) {
   const vertexBuffer = useRef<Float32Array>(
     new Float32Array(MESH_VERTEX_COUNT * 3),
@@ -94,18 +90,10 @@ function SMPLMesh({
     const firstFrame = keyframes.find((kf) => kf.mesh_vertices);
     if (firstFrame?.mesh_vertices) {
       const verts = firstFrame.mesh_vertices;
-      // 先填充原始顶点，再应用 spine 旋转
-      const tempVerts = new Float32Array(verts.length * 3);
       for (let k = 0; k < verts.length; k++) {
-        tempVerts[k * 3] = verts[k][0];
-        tempVerts[k * 3 + 1] = verts[k][1];
-        tempVerts[k * 3 + 2] = verts[k][2];
-      }
-      applyRotationToJoints(tempVerts, spineQuat);
-      for (let k = 0; k < verts.length; k++) {
-        positions[k * 3] = (tempVerts[k * 3] + offset[0]) * scale;
-        positions[k * 3 + 1] = (tempVerts[k * 3 + 1] + offset[1]) * scale;
-        positions[k * 3 + 2] = (tempVerts[k * 3 + 2] + offset[2]) * scale;
+        positions[k * 3] = (verts[k][0] + offset[0]) * scale;
+        positions[k * 3 + 1] = (verts[k][1] + offset[1]) * scale;
+        positions[k * 3 + 2] = (verts[k][2] + offset[2]) * scale;
       }
     }
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -120,13 +108,11 @@ function SMPLMesh({
     geo.computeVertexNormals();
 
     return geo;
-  }, [keyframes, faces, offset, scale, spineQuat]);
+  }, [keyframes, faces, offset, scale]);
 
   useFrame(() => {
     const ms = timeline.getMs();
     sampleMeshVertices(timeIndex, ms, vertexBuffer.current);
-    // 应用 spine 朝向校正（横卧视频 → 直立）
-    applyRotationToJoints(vertexBuffer.current, spineQuat);
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const arr = posAttr.array as Float32Array;
@@ -172,13 +158,11 @@ function SkeletonRig({
   offset,
   scale,
   timeIndex,
-  spineQuat,
 }: {
   timeline: PoseTimeline;
   offset: [number, number, number];
   scale: number;
   timeIndex: ReturnType<typeof buildTimeIndex>;
-  spineQuat: [number, number, number, number];
 }) {
   const buffer = useRef<Float32Array>(new Float32Array(JOINT_COUNT * 3));
   const jointRefs = useRef<Array<THREE.Mesh | null>>([]);
@@ -193,8 +177,6 @@ function SkeletonRig({
   useFrame(() => {
     const ms = timeline.getMs();
     sampleJoints(timeIndex, ms, buffer.current);
-    // 应用 spine 朝向校正（横卧视频 → 直立）
-    applyRotationToJoints(buffer.current, spineQuat);
     const buf = buffer.current;
 
     // 辅助：获取关节的最终场景坐标（含 nudge + offset + scale）
@@ -330,11 +312,6 @@ export default function CombinedViewer({
     [keyframes, targetSize],
   );
   const timeIndex = useMemo(() => buildTimeIndex(keyframes), [keyframes]);
-  // Spine 朝向校正四元数（横卧视频 → 直立）
-  const spineQuat = useMemo(
-    () => computeSpineOrientation(keyframes),
-    [keyframes],
-  );
   const { offset, scale } = framing;
 
   return (
@@ -354,14 +331,12 @@ export default function CombinedViewer({
         offset={offset}
         scale={scale}
         timeIndex={timeIndex}
-        spineQuat={spineQuat}
       />
       <SkeletonRig
         timeline={timeline}
         offset={offset}
         scale={scale}
         timeIndex={timeIndex}
-        spineQuat={spineQuat}
       />
       <OrbitControls
         makeDefault
