@@ -81,10 +81,18 @@ function SMPLMesh({
     if (firstFrame?.mesh_vertices) {
       const { offset, scale } = framing;
       const verts = firstFrame.mesh_vertices;
+      // 先填充原始顶点，再应用 spine 旋转
+      const tempVerts = new Float32Array(verts.length * 3);
       for (let k = 0; k < verts.length; k++) {
-        positions[k * 3] = (verts[k][0] + offset[0]) * scale;
-        positions[k * 3 + 1] = (verts[k][1] + offset[1]) * scale;
-        positions[k * 3 + 2] = (verts[k][2] + offset[2]) * scale;
+        tempVerts[k * 3] = verts[k][0];
+        tempVerts[k * 3 + 1] = verts[k][1];
+        tempVerts[k * 3 + 2] = verts[k][2];
+      }
+      applyRotationToJoints(tempVerts, spineQuat);
+      for (let k = 0; k < verts.length; k++) {
+        positions[k * 3] = (tempVerts[k * 3] + offset[0]) * scale;
+        positions[k * 3 + 1] = (tempVerts[k * 3 + 1] + offset[1]) * scale;
+        positions[k * 3 + 2] = (tempVerts[k * 3 + 2] + offset[2]) * scale;
       }
     }
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -102,7 +110,7 @@ function SMPLMesh({
     geo.computeVertexNormals();
 
     return geo;
-  }, [keyframes, faces, framing]);
+  }, [keyframes, faces, framing, spineQuat]);
 
   const { offset, scale } = framing;
 
