@@ -221,8 +221,8 @@ export function sampleJoints(
     const j = keyframes[0].joints_3d;
     for (let k = 0; k < j.length && k * 3 + 2 < out.length; k++) {
       out[k * 3] = j[k][0];
-      out[k * 3 + 1] = j[k][1];
-      out[k * 3 + 2] = j[k][2];
+      out[k * 3 + 1] = -j[k][1]; // 相机坐标→世界坐标：Y 翻转
+      out[k * 3 + 2] = -j[k][2]; // Z 翻转
     }
     return out;
   }
@@ -244,8 +244,8 @@ export function sampleJoints(
     const pa: Vec3 = ja[k];
     const pb: Vec3 = jb[k];
     out[k * 3] = pa[0] + (pb[0] - pa[0]) * frac;
-    out[k * 3 + 1] = pa[1] + (pb[1] - pa[1]) * frac;
-    out[k * 3 + 2] = pa[2] + (pb[2] - pa[2]) * frac;
+    out[k * 3 + 1] = -(pa[1] + (pb[1] - pa[1]) * frac); // 相机坐标→世界坐标：Y 翻转
+    out[k * 3 + 2] = -(pa[2] + (pb[2] - pa[2]) * frac); // Z 翻转
   }
   return out;
 }
@@ -280,8 +280,8 @@ export function sampleMeshVertices(
       const verts = keyframes[idx].mesh_vertices!;
       for (let k = 0; k < verts.length && k * 3 + 2 < out.length; k++) {
         out[k * 3] = verts[k][0];
-        out[k * 3 + 1] = verts[k][1];
-        out[k * 3 + 2] = verts[k][2];
+        out[k * 3 + 1] = -verts[k][1]; // 相机坐标→世界坐标：Y 翻转
+        out[k * 3 + 2] = -verts[k][2]; // Z 翻转
       }
     }
     return out;
@@ -312,8 +312,8 @@ export function sampleMeshVertices(
     const pa = va[k];
     const pb = vb[k];
     out[k * 3] = pa[0] + (pb[0] - pa[0]) * frac;
-    out[k * 3 + 1] = pa[1] + (pb[1] - pa[1]) * frac;
-    out[k * 3 + 2] = pa[2] + (pb[2] - pa[2]) * frac;
+    out[k * 3 + 1] = -(pa[1] + (pb[1] - pa[1]) * frac); // 相机坐标→世界坐标：Y 翻转
+    out[k * 3 + 2] = -(pa[2] + (pb[2] - pa[2]) * frac); // Z 翻转
   }
   return out;
 }
@@ -325,12 +325,12 @@ export function computeMeshFraming(
   keyframes: Keyframe[],
   targetSize = 2.4,
 ): FrameTransform {
-  // 收集所有 mesh 顶点
+  // 收集所有 mesh 顶点（相机坐标→世界坐标：Y 翻转，Z 翻转）
   const allVertices: number[] = [];
   for (const kf of keyframes) {
     if (!kf.mesh_vertices) continue;
     for (const [x, y, z] of kf.mesh_vertices) {
-      allVertices.push(x, y, z);
+      allVertices.push(x, -y, -z);
     }
   }
 
@@ -379,11 +379,11 @@ export function computeFraming(
     return { offset: [0, 0, 0], scale: 1 };
   }
 
-  // 收集所有关节坐标
+  // 收集所有关节坐标（相机坐标→世界坐标：Y 翻转，Z 翻转）
   const allJoints: number[] = [];
   for (const kf of keyframes) {
     for (const [x, y, z] of kf.joints_3d) {
-      allJoints.push(x, y, z);
+      allJoints.push(x, -y, -z);
     }
   }
 
