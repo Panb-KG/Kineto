@@ -66,7 +66,7 @@ export function useVideoSync() {
     const m = modelRef.current;
     const a = analysisRef.current;
     if (!m || !a || lock.current) return;
-    if (Math.abs(m.currentTime - a.currentTime) > 0.35) {
+    if (Math.abs(m.currentTime - a.currentTime) > 0.10) {
       a.currentTime = m.currentTime;
     }
   }, []);

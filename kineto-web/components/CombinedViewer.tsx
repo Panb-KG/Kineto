@@ -41,6 +41,18 @@ const JOINT_COLOR = "#2b3a46";
 const BONE_RADIUS = 0.016;
 const HEAD_JOINT_INDEX = 15;
 
+/**
+ * 肩髋关节微调偏移（模型空间，应用 offset/scale 前叠加到 joints_3d）。
+ * SMPL rest pose 中 shoulder(16/17) 偏内侧 ~2mm，hip(1/2) 偏下 ~1.5mm；
+ * 此处以补偿量叠加，使骨架与 mesh 在叠加模式下更精确重合。
+ */
+const JOINT_NUDGE: Record<number, [number, number, number]> = {
+  16: [-0.002, 0, 0],   // left_shoulder: 向外（左）微移 2mm
+  17: [ 0.002, 0, 0],   // right_shoulder: 向外（右）微移 2mm
+  1:  [ 0, -0.0015, 0], // left_hip: 向下微移 1.5mm
+  2:  [ 0, -0.0015, 0], // right_hip: 向下微移 1.5mm
+};
+
 interface CombinedViewerProps {
   keyframes: Keyframe[];
   faces: Vec3[];
@@ -167,14 +179,24 @@ function SkeletonRig({
     sampleJoints(timeIndex, ms, buffer.current);
     const buf = buffer.current;
 
+    // 辅助：获取关节的最终场景坐标（含 nudge + offset + scale）
+    const jx = (i: number) => {
+      const n = JOINT_NUDGE[i];
+      return (buf[i * 3] + (n ? n[0] : 0) + offset[0]) * scale;
+    };
+    const jy = (i: number) => {
+      const n = JOINT_NUDGE[i];
+      return (buf[i * 3 + 1] + (n ? n[1] : 0) + offset[1]) * scale;
+    };
+    const jz = (i: number) => {
+      const n = JOINT_NUDGE[i];
+      return (buf[i * 3 + 2] + (n ? n[2] : 0) + offset[2]) * scale;
+    };
+
     for (let i = 0; i < JOINT_COUNT; i++) {
       const mesh = jointRefs.current[i];
       if (!mesh) continue;
-      mesh.position.set(
-        (buf[i * 3] + offset[0]) * scale,
-        (buf[i * 3 + 1] + offset[1]) * scale,
-        (buf[i * 3 + 2] + offset[2]) * scale,
-      );
+      mesh.position.set(jx(i), jy(i), jz(i));
     }
 
     for (let b = 0; b < SMPL_SKELETON.length; b++) {
@@ -182,16 +204,8 @@ function SkeletonRig({
       const mesh = boneRefs.current[b];
       if (!mesh) continue;
 
-      tmpA.set(
-        (buf[ia * 3] + offset[0]) * scale,
-        (buf[ia * 3 + 1] + offset[1]) * scale,
-        (buf[ia * 3 + 2] + offset[2]) * scale,
-      );
-      tmpB.set(
-        (buf[ib * 3] + offset[0]) * scale,
-        (buf[ib * 3 + 1] + offset[1]) * scale,
-        (buf[ib * 3 + 2] + offset[2]) * scale,
-      );
+      tmpA.set(jx(ia), jy(ia), jz(ia));
+      tmpB.set(jx(ib), jy(ib), jz(ib));
 
       tmpDir.subVectors(tmpB, tmpA);
       const len = tmpDir.length();

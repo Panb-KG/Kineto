@@ -1263,12 +1263,14 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
             print("[Grid] ⚠️  无法探测视频尺寸，跳过四宫格生成", file=sys.stderr)
             return {"grid_images": grid_images, "grid_labels": grid_labels}
 
+        frame_aspect = w / h  # 原始帧长宽比
+
         # 用于 bbox 投影的临时渲染器（全帧分辨率）
         bbox_renderer = SkeletonRenderer(w, h, focal_length=focal_length,
                                          image_size=image_size)
 
         # ---- 第一遍：收集裁剪后的帧 ----
-        PAD_RATIO = 0.20          # bbox 四周留白比例
+        PAD_RATIO = 0.35          # bbox 四周留白比例（加大以避免裁剪头脚）
         TARGET_H = 512            # 统一输出高度
         cropped_frames = []       # (annotated_bgr, label)
 
@@ -1300,6 +1302,28 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
             crop_y1 = max(0, int(y_min - pad_y))
             crop_x2 = min(w, int(x_max + pad_x))
             crop_y2 = min(h, int(y_max + pad_y))
+
+            # 保持原始长宽比：扩展裁剪区域以匹配帧宽高比
+            crop_w = crop_x2 - crop_x1
+            crop_h = crop_y2 - crop_y1
+            target_crop_h = int(crop_w / frame_aspect)
+            if target_crop_h > crop_h:
+                # 需要增加高度（上下均匀扩展）
+                extra = target_crop_h - crop_h
+                crop_y1 = max(0, crop_y1 - extra // 2)
+                crop_y2 = crop_y1 + target_crop_h
+                if crop_y2 > h:
+                    crop_y2 = h
+                    crop_y1 = max(0, crop_y2 - target_crop_h)
+            else:
+                # 需要增加宽度（左右均匀扩展）
+                target_crop_w = int(crop_h * frame_aspect)
+                extra = target_crop_w - crop_w
+                crop_x1 = max(0, crop_x1 - extra // 2)
+                crop_x2 = crop_x1 + target_crop_w
+                if crop_x2 > w:
+                    crop_x2 = w
+                    crop_x1 = max(0, crop_x2 - target_crop_w)
 
             # 裁剪原帧
             cropped = frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
@@ -1337,7 +1361,7 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
         if not cropped_frames:
             return {"grid_images": grid_images, "grid_labels": grid_labels}
 
-        # ---- 第二遍：统一画布尺寸 ----
+        # ---- 第二遍：统一画布尺寸（保持原始长宽比）----
         # 按目标高度等比缩放每张图，宽度按比例；然后 pad 到最大宽度
         max_canvas_w = 0
         resized = []
@@ -1382,6 +1406,36 @@ def _generate_grid_images(video_path: str, keyframes: list, output_dir: Path,
         cap.release()
 
     return {"grid_images": grid_images, "grid_labels": grid_labels}
+
+
+# ============================================================================
+# ffmpeg H.264 转码（确保浏览器兼容）
+# ============================================================================
+
+def _transcode_to_h264(output_file: Path) -> None:
+    """使用 ffmpeg 将视频转码为 H.264，确保浏览器可播放。
+    如果 ffmpeg 不可用或转码失败，保留原始文件不做处理。
+    """
+    import subprocess
+    h264_output = output_file.with_name(output_file.stem + "_h264.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(output_file),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(h264_output),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        output_file.unlink()
+        h264_output.rename(output_file)
+        print(f"[ffmpeg] ✅ H.264 转码成功: {output_file.name}")
+    except Exception as e:
+        print(f"[ffmpeg] ⚠️  转码失败（使用原始编码）: {e}", file=sys.stderr)
+        if h264_output.exists():
+            h264_output.unlink()
 
 
 # ============================================================================
@@ -1456,6 +1510,10 @@ def _generate_annotated_video(video_path: str, keyframes: list, output_path: Pat
 
     file_size_mb = output_file.stat().st_size / (1024 * 1024)
     print(f"[Annotated] ✅ 生成完成: {output_file.name} ({processed} 帧, {file_size_mb:.1f}MB)")
+
+    # [Fix #67] ffmpeg 转码为 H.264，确保浏览器可播放
+    _transcode_to_h264(output_file)
+
     return "annotated_output.mp4"
 
 
@@ -1745,6 +1803,9 @@ def _process_video_impl(stack, input_path, output_dir, device,
 
     cap2.release()
     writer.release()
+
+    # [Fix #67] ffmpeg 转码为 H.264，确保浏览器可播放
+    _transcode_to_h264(video_out_path)
 
     # ---- 第 4 步：生成全帧骨骼标注视频 ----
     try:
