@@ -308,6 +308,15 @@ body::before {
   color: var(--ink-faint);
 }
 
+/* [P1.1] mesh 后台加载/失败遮罩：覆盖 viewer-frame，不阻挡模式切换按钮 */
+.viewer-mesh-status {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(4px);
+  z-index: 5;
+}
+
 /* ── Mesh 视图模式切换 ─────────────────────────────────────────────── */
 .viewer-mode-toggle {
   position: absolute;

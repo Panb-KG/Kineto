@@ -71,6 +71,17 @@
 - **真机 E2E PASS**（job `d9ef1171...`，466 帧）：`mesh_vertices.f32` = 38,528,880 bytes（精确 466×6890×3×4）；G14 全帧断言 **mean/max 0.00mm PASS**；代理链 `/api/jobs/{id}/mesh_vertices.f32` 返回 200，MD5 与引擎直出 `36cb2e8d...` 完全一致；`tsc --noEmit` + `npm run lint`（补 `.eslintrc.json` + eslint@8）+ check_ssot 全过。
 - **部署说明**：引擎代码已 rsync 到设备并重启（需 sudo，因服务 User=kineto）；前端已 push `e6d7311` 触发 Zeabur 自动部署。
 
+### 2026-09-10 P1.1 mesh 传输压缩（DRACO + GZip，公网 mesh 恢复可用）
+- **问题**：P1 的 f32 mesh 38.5MB 经 Tailscale Funnel 中继（生产关键段 Zeabur→Funnel 实测仅 ~42KB/s）需 5-15 分钟必然超时 → `meshTrack` 加载失败 → 新格式 keyframes 无嵌入顶点 → `hasMesh=false` → mesh/骨骼/叠加三态按钮整个消失（用户报「输出框看不到 mesh」）。
+- **引擎** `kineto_core.py`：新增 `encode_mesh_track_drcs()`——DracoPy 14bit 量化（步长 ~0.03mm，实测误差 max 0.07mm，视觉无损）+ stride=3 时间抽帧（mesh 6.7fps，156 帧；骨架仍全帧 20fps）。**KDRC v2 容器**（小端）：magic"KDRC" | version u16(=2) | bits u16 | frameCount u32 | vpf u32 | stride u32 | **perm u32[vpf]** | offsets u32[frameCount] | DRACO blob 拼接。关键：DRACO 按连通性重排顶点编号，引擎编码后立即解码首帧，用 3D 最近点匹配（分块 512 行算距离矩阵，容差 1mm）求 orig→dec 排列 perm 写入容器头，并断言三角形多重集一致（排列自验）。异常回退写全帧 `mesh_vertices.f32`。metadata产物：466 帧视频 `mesh_track.drcs` = **3.0MB**（vs 38.5MB，12.7×）；metadata 新增 `mesh_encoding="draco14"`/`mesh_frame_stride=3`。
+- **引擎** `api.py`：`GZipMiddleware(minimum_size=500)`（JSON 3.2MB→gzip 829KB；octet-stream 不压）；新增 `GET /jobs/{id}/mesh_track.drcs`（X-API-Key 保护，.f32 端点保留）。`requirements.txt` 加 `DracoPy>=2.0.0`（设备 venv 已装）。
+- **前端**：DRACO 解码用 three 自带 `DRACOLoader`，wasm/JS 三件套拷到 `public/draco/`（同源，无 CDN）；`poseData.ts` 解析 KDRC 头读 perm 直接还原 SMPL 原始顶点序（面索引仍用 JSON 的 `mesh_faces`），逐帧解码后预翻转 y→-y/z→-z；`MeshTrack` 加 `times: Float64Array`（mesh 帧 k 时间戳 = `keyframes[k*stride].timestamp_ms`）；`timeline.ts` 的 `sampleMeshVertices` 改用 **meshTrack 独立时间轴二分插值**（不再要求 frameCount===keyframes 数）。
+- **前端架构**：mesh 改**后台异步加载**——`loadPoseData` 骨架就绪即返回（不 await mesh），`ViewerStage` 另起 state 调 `loadMeshTrack`；`hasMesh` 与轨道加载状态**解耦**（基于 metadata.has_mesh + mesh_faces + 文件名/嵌入判定），三态按钮常驻；track 未就绪时 mesh/叠加视图显示「Mesh 模型加载中…」遮罩，失败显示错误遮罩且骨架不受影响。
+- **前端** `route.ts`：白名单加 `mesh_track.drcs`；**修 gzip 双解压 bug**——undici fetch 自动解压上游 gzip 但保留 `content-encoding` 头，透传会导致浏览器把明文 JSON 当 gzip 二次解压（JSON 解析失败），HOP_BY_HOP 加剥 `content-encoding`（慢的 Funnel 段仍压缩，仅 Zeabur→浏览器段明文）。
+- **门禁** `check_ssot.py` G14：`_decode_drcs_track()` 解析 KDRC v2 头读 perm（不再依赖面序假设，见坑 #19），gather 回原始序后 `np.einsum` 回归 joints；draco 路径 mesh 帧对照 `keyframes[::stride]`。
+- **真机 E2E PASS**（job `89beefcf...`，466 帧）：drcs 3.07MB、无 f32；G14 设备上 **156 帧全部容差内（mean 0.02mm / max 0.07mm）**；公网 Funnel 实测 JSON gzip 829KB/5.5s、drcs 3.07MB/8.3s（原 f32 需 ~15 分钟）；Next 代理透传 drcs 字节一致；浏览器 E2E 骨架→Mesh→叠加三态全部正常渲染。
+- **注意**：G14 在设备上无法用 `check_ssot.py --pose-data` 直接跑（G12 因缺 kineto-web 提前 `return 3`，G14 根本不执行）——需 `python -c` 导入模块直接调 `check_mesh_joints_alignment(path, engine_dir, Report())`。
+
 ## 3. 核心信息速查（设备与服务）
 
 ### 访问方式
@@ -100,7 +111,8 @@
 | `GET /health` | 鉴权；返回 device=xpu、模型加载状态 |
 | `POST /jobs` | multipart `video=@file` 或 JSON `video_path`（限 inbox 内）→ 返回 `job_id` |
 | `GET /jobs/{id}` | 状态字段是 **`state`**（queued/running/done/failed），另有 progress/quality_score/extraction_mode |
-| `GET /jobs/{id}/pose_data.json` / `demo_output.mp4` | 完成后取产物 |
+| `GET /jobs/{id}/pose_data.json` / `demo_output.mp4` / `annotated_output.mp4` / `input.mp4` | 完成后取产物（JSON 经 GZip 压缩，~829KB/466 帧） |
+| `GET /jobs/{id}/mesh_track.drcs` | [P1.1] SMPL mesh 轨道（KDRC v2 容器：DRACO 14bit + stride3 抽帧，~3MB）；旧回退格式 `mesh_vertices.f32`（全帧 f32，~38.5MB） |
 
 ### 验收基线（复验锚点）
 - 466 帧视频，device=xpu，4dhumans，质量分 0.9936，~62s；`KINETO_API_KEY=$(grep KINETO_API_KEY /etc/kineto/kineto-engine.env | cut -d= -f2) bash deploy/validate.sh --mofang-mode stripped`
@@ -131,6 +143,10 @@
 16. **smplx 0.1.28 `pose2rot=False` 形状约定**：`global_orient` 必须是 `(B,1,3,3)`（与 `body_pose` 的 `(B,23,3,3)` 同维才能 `torch.cat`），传 `(B,3,3)` 抛 RuntimeError；引擎 mesh 路径宽 except 会把这类错误吞成 `has_mesh: False` 静默降级——mesh 相关改动必须用真产物验证 G14，不能只看 job state=done。
 17. **设备离线跑引擎 CLI 需 `HOME=/srv/kineto`**：HMR2 `get_config` 的 cachedir 依赖 HOME 解析到 `~/.cache/4DHumans`（服务以 kineto 用户跑、HOME=/srv/kineto）；juxin 直接跑会 `FileNotFoundError: …/model_config.yaml`。离线复现：`cd /opt/kineto/kineto-engine && HOME=/srv/kineto /opt/kineto/venv/bin/python3 kineto_core.py -i <video> -o <dir>`（juxin 在 video/render 组，XPU 可用；output_test 归 juxin 可写）。
 18. **无 sudo 远程运维 AI BOX（juxin sudo 需密码）**：juxin 在 `docker` 组 = 等价 root。读改 root 文件：`docker run --rm --user 0 --entrypoint sh -v /etc/kineto:/e <镜像> -c '…'`（mofang 镜像内置非 root USER，必须显式 `--user 0`；容器内无宿主组名，chown 用数字 GID，`getent group kineto` 查）。重启 systemd 服务：`docker run --rm --pid=host --user 0 --cap-add SYS_PTRACE --security-opt apparmor=unconfined <镜像> kill -TERM <主进程PID>` → `Restart=always` 自动拉起（默认 AppArmor docker-default 拦跨命名空间 signal，必须 unconfined + SYS_PTRACE）。改 env 文件后注意恢复 `chown root:kineto`（GID 982）+ `chmod 640`。
+19. **DRACO 压缩会重排顶点编号，且解码面序/绕序不可假定与输入一致**：DracoPy/DRACOLoader 按连通性遍历重排顶点（跨帧确定性一致：解码 faces 逐帧完全相同），但「面 i 解码后仍是输入面 i」的假设**实测不成立**（G14 面角对应断言失败）。正确做法（KDRC v2）：编码方持有原始顶点 → 编码后立即解码首帧 → 3D 最近点匹配（量化误差 ≪ 顶点间距，匹配唯一）求 orig→dec 排列 perm，断言双射 + 三角形多重集一致，perm 写入容器头；消费方直接套 perm，零假设。前端面索引仍用 JSON 的 SMPL 标准 `mesh_faces`（perm 还原后顶点序与面表同序）。
+20. **Next.js 代理上游 gzip 的双解压坑**：引擎加 `GZipMiddleware` 后，route handler 里 `fetch()`（undici）自动解压 body 但**响应头保留 `content-encoding: gzip`**；若原样转发响应头，浏览器会把已解压的明文 body 再当 gzip 解压 → JSON parse 失败（curl `--compressed` 表现为 0B）。代理转发响应头必须剥 `content-encoding`（`content-length` 同理已剥）。
+21. **dev 模式 React StrictMode 双挂载产生的 ERR_ABORTED 是噪音**：effect 双跑 → 首轮 AbortController 取消在途请求（视频/mesh/draco worker），控制台见 `ERR_ABORTED`；二轮重试即成功（生产构建无此问题）。判断标准：功能最终是否正常渲染，而非控制台有无 abort。
+22. **设备上跑 G14 不能用 `check_ssot.py --pose-data`**：main() 在 G12 发现缺 `kineto-web/lib/skeleton.ts` 时 `return 3` 提前退出，G14 段根本不执行。设备上单跑 G14：`cd /opt/kineto/kineto-engine && /opt/kineto/venv/bin/python -c "import check_ssot as c; from pathlib import Path; rep=c.Report(); c.check_mesh_joints_alignment(Path('<job>/pose_data.json'), Path('.'), rep); print(len(rep.errors), len(rep.drifts))"`（DracoPy 只装在 venv，Mac 系统 python 无 DracoPy → G14 SKIP）。
 
 ## 5. 待办 / 后续方向
 

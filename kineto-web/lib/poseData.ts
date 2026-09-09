@@ -13,11 +13,13 @@
 
 import {
   ApiError,
-  fetchMeshVerticesRaw,
+  fetchMeshTrackFile,
   fetchPoseData,
   isApiConfigured,
 } from "./api";
-import type { MeshTrack, PoseData } from "./types";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
+import type { BufferGeometry } from "three";
+import type { Keyframe, MeshTrack, PoseData } from "./types";
 import { JOINT_COUNT, JOINT_ORDER_CANONICAL, MESH_VERTEX_COUNT } from "./types";
 
 /**
@@ -34,67 +36,207 @@ export interface LoadedPoseData {
   source: PoseDataSource;
   /** 若从 API 回退到 fixture，此处记录回退原因，供 UI 提示。 */
   fallbackReason?: string;
-  /**
-   * [P1 mesh 节奏贴合] SMPL 顶点二进制轨道（仅 API 产物携带；
-   * fixture / 旧 16 帧嵌入格式产物无此字段，叠加模式回退旧采样路径）。
-   */
-  meshTrack?: MeshTrack;
+}
+
+// ── [P1.1] DRACO 解码器（单例；WASM 从同源 /draco/ 加载，无 CDN 依赖）────────
+let dracoLoaderSingleton: DRACOLoader | null = null;
+function getDracoLoader(): DRACOLoader {
+  if (!dracoLoaderSingleton) {
+    dracoLoaderSingleton = new DRACOLoader().setDecoderPath("/draco/");
+  }
+  return dracoLoaderSingleton;
 }
 
 /**
- * [P1] 组装 mesh 二进制轨道：相机系→世界系预翻转（y→-y, z→-z，与
- * sampleJoints 同一变换），帧数必须与 keyframes 1:1（节奏映射契约）。
+ * KDRC v2 容器头（小端）：
+ * magic 4B | version u16(=2) | bits u16 | frameCount u32 | vpf u32 |
+ * stride u32 | perm u32[vpf]（perm[orig_v]=dec_v，引擎编码时以 3D 最近点
+ * 匹配求出）| offsets u32[frameCount] | 逐帧 DRACO blob。
  */
-function buildMeshTrack(raw: Float32Array, keyframeCount: number): MeshTrack {
-  const frameCount = raw.length / (MESH_VERTEX_COUNT * 3);
-  if (!Number.isInteger(frameCount) || frameCount !== keyframeCount) {
+interface DrcHeader {
+  frameCount: number;
+  vertexCount: number;
+  stride: number;
+  /** orig→dec 顶点排列：SMPL 原始序顶点 v 的解码位置 = perm[v]。 */
+  perm: Uint32Array;
+  offsets: Uint32Array;
+  headerLen: number;
+}
+
+function parseDrcHeader(buf: ArrayBuffer): DrcHeader {
+  const bytes = new Uint8Array(buf, 0, 4);
+  const magic = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+  if (magic !== "KDRC") {
+    throw new Error("mesh_track.drcs magic 非法（文件损坏或非本管线产物）");
+  }
+  const dv = new DataView(buf);
+  const version = dv.getUint16(4, true);
+  if (version < 2) {
+    throw new Error(`KDRC v${version} 为开发期旧格式（不含顶点排列），请重新生成产物`);
+  }
+  const frameCount = dv.getUint32(8, true);
+  const vertexCount = dv.getUint32(12, true);
+  const stride = dv.getUint32(16, true);
+  const permOffset = 20;
+  const offsetsOffset = permOffset + 4 * vertexCount;
+  const headerLen = offsetsOffset + 4 * frameCount;
+  if (frameCount <= 0 || vertexCount <= 0 || buf.byteLength < headerLen) {
+    throw new Error("mesh_track.drcs 容器头截断或字段非法");
+  }
+  const perm = new Uint32Array(buf, permOffset, vertexCount);
+  // 双射校验（文件损坏不应静默渲染错序网格）
+  const seen = new Set<number>();
+  for (let v = 0; v < vertexCount; v++) {
+    const d = perm[v];
+    if (d >= vertexCount || seen.has(d)) {
+      throw new Error("mesh_track.drcs perm 非双射（容器损坏）");
+    }
+    seen.add(d);
+  }
+  const offsets = new Uint32Array(buf, offsetsOffset, frameCount);
+  return { frameCount, vertexCount, stride, perm, offsets, headerLen };
+}
+
+/** 解码单个 DRACO blob → 顶点位置（draco 排列）。 */
+function decodeDracoPositions(
+  loader: DRACOLoader,
+  blob: ArrayBuffer,
+): Promise<Float32Array> {
+  return new Promise((resolve, reject) => {
+    loader.parse(
+      blob,
+      (geo: BufferGeometry) => {
+        try {
+          const posAttr = geo.getAttribute("position");
+          if (!posAttr) {
+            reject(new Error("DRACO 解码缺 position 属性"));
+            return;
+          }
+          resolve(Float32Array.from(posAttr.array as ArrayLike<number>));
+        } catch (exc) {
+          reject(exc instanceof Error ? exc : new Error(String(exc)));
+        }
+      },
+      (err: unknown) => reject(err instanceof Error ? err : new Error(String(err))),
+    );
+  });
+}
+
+/** [P1.1] 解码 KDRC v2 容器 → MeshTrack（顶点经容器头 perm 还原 SMPL
+ *  原始序 + 预翻转 + times）。面索引仍用 pose_data.json 根级 mesh_faces。 */
+async function buildDracoTrack(buf: ArrayBuffer, data: PoseData): Promise<MeshTrack> {
+  const hdr = parseDrcHeader(buf);
+  if (hdr.vertexCount !== MESH_VERTEX_COUNT) {
     throw new Error(
-      `mesh_vertices.f32 帧数不符：${frameCount} ≠ keyframes ${keyframeCount}`,
+      `mesh_track.drcs 顶点数 ${hdr.vertexCount} 非 SMPL 标准 ${MESH_VERTEX_COUNT}`,
     );
   }
-  // 预翻转：一次 O(n) 拷贝，采样期零额外变换
+  const keyframes = data.keyframes;
+
+  // mesh 帧 k ↔ keyframes[k*stride] 的时间戳
+  const times = new Float64Array(hdr.frameCount);
+  for (let k = 0; k < hdr.frameCount; k++) {
+    const ki = k * hdr.stride;
+    if (ki >= keyframes.length) {
+      throw new Error(`mesh 帧 ${k} 经 stride=${hdr.stride} 映射越界`);
+    }
+    times[k] = keyframes[ki].timestamp_ms;
+  }
+
+  const loader = getDracoLoader();
+  const vertices = new Float32Array(hdr.frameCount * hdr.vertexCount * 3);
+  const perm = hdr.perm;
+  const lastOffset = hdr.offsets[hdr.frameCount - 1];
+  for (let k = 0; k < hdr.frameCount; k++) {
+    const start = hdr.offsets[k];
+    const end = k + 1 < hdr.frameCount ? hdr.offsets[k + 1] : buf.byteLength;
+    if (start < hdr.headerLen || end > buf.byteLength || end <= start) {
+      throw new Error(`帧 ${k} blob 偏移非法（[${start}, ${end})）`);
+    }
+    const positions = await decodeDracoPositions(loader, buf.slice(start, end));
+    if (positions.length !== hdr.vertexCount * 3) {
+      throw new Error(`帧 ${k} DRACO 顶点数 ${positions.length / 3} ≠ ${hdr.vertexCount}`);
+    }
+    const base = k * hdr.vertexCount * 3;
+    for (let v = 0; v < hdr.vertexCount; v++) {
+      const di = perm[v] * 3; // orig 序 v → draco 序 perm[v]
+      vertices[base + v * 3] = positions[di];
+      vertices[base + v * 3 + 1] = -positions[di + 1]; // 相机系→世界系：Y 翻转
+      vertices[base + v * 3 + 2] = -positions[di + 2]; // Z 翻转
+    }
+  }
+  // 末帧偏移必须落在容器内（偏移表损坏的兜底校验）
+  if (lastOffset >= buf.byteLength) {
+    throw new Error("mesh_track.drcs 末帧偏移越界");
+  }
+  return { frameCount: hdr.frameCount, vertexCount: hdr.vertexCount, vertices, times };
+}
+
+/**
+ * [P1] f32 全帧轨道组装：相机系→世界系预翻转（y→-y, z→-z，与
+ * sampleJoints 同一变换），帧数必须与 keyframes 1:1。
+ */
+function buildF32Track(raw: Float32Array, keyframes: Keyframe[]): MeshTrack {
+  const frameCount = raw.length / (MESH_VERTEX_COUNT * 3);
+  if (!Number.isInteger(frameCount) || frameCount !== keyframes.length) {
+    throw new Error(
+      `mesh_vertices.f32 帧数不符：${frameCount} ≠ keyframes ${keyframes.length}`,
+    );
+  }
+  const times = new Float64Array(frameCount);
   for (let i = 0; i < frameCount; i++) {
+    times[i] = keyframes[i].timestamp_ms;
     const base = i * MESH_VERTEX_COUNT * 3;
     for (let k = 0; k < MESH_VERTEX_COUNT; k++) {
       raw[base + k * 3 + 1] = -raw[base + k * 3 + 1]; // Y 翻转
       raw[base + k * 3 + 2] = -raw[base + k * 3 + 2]; // Z 翻转
     }
   }
-  return { frameCount, vertexCount: MESH_VERTEX_COUNT, vertices: raw };
+  return { frameCount, vertexCount: MESH_VERTEX_COUNT, vertices: raw, times };
 }
 
-/** 从 API 拉取 mesh 二进制并组装 MeshTrack；失败返回 undefined（不阻塞骨架）。 */
-async function loadMeshTrack(
+/**
+ * 拉取并解码 mesh 轨道（DRACO 压缩或 f32 回退）。
+ * 设计为**不阻塞骨架展示**：由 ViewerStage 在 pose 就绪后后台调用，
+ * 失败返回 undefined（mesh 模式提示加载失败，骨架不受影响）。
+ */
+export async function loadMeshTrack(
   jobId: string,
   data: PoseData,
   signal?: AbortSignal,
 ): Promise<MeshTrack | undefined> {
-  const { mesh_vertices_file, mesh_vertices_frames, mesh_vertices_per_frame } =
-    data.metadata;
-  if (!mesh_vertices_file || !mesh_vertices_frames || !mesh_vertices_per_frame) {
-    return undefined;
+  const {
+    mesh_vertices_file: file,
+    mesh_vertices_frames: frames,
+    mesh_vertices_per_frame: vpf,
+    mesh_encoding: encoding,
+  } = data.metadata;
+  if (!file || !frames || !vpf) {
+    return undefined; // 旧 JSON 嵌入格式或无 mesh 产物
   }
-  if (mesh_vertices_per_frame !== MESH_VERTEX_COUNT) {
+  if (vpf !== MESH_VERTEX_COUNT) {
     // eslint-disable-next-line no-console
     console.warn(
-      `[kineto] mesh_vertices_per_frame=${mesh_vertices_per_frame} 非 SMPL 标准 ` +
-        `${MESH_VERTEX_COUNT}，忽略二进制轨道（叠加模式回退旧路径）`,
+      `[kineto] mesh_vertices_per_frame=${vpf} 非 SMPL 标准 ` +
+        `${MESH_VERTEX_COUNT}，忽略 mesh 轨道（mesh 模式回退嵌入路径）`,
     );
     return undefined;
   }
   try {
-    const raw = await fetchMeshVerticesRaw(
-      jobId,
-      mesh_vertices_frames,
-      mesh_vertices_per_frame,
-      signal,
-    );
-    return buildMeshTrack(raw, data.keyframes.length);
+    const buf = await fetchMeshTrackFile(jobId, file, signal);
+    if ((encoding ?? "").startsWith("draco")) {
+      return await buildDracoTrack(buf, data);
+    }
+    // f32 全帧回退格式
+    if (buf.byteLength !== frames * vpf * 3 * 4) {
+      throw new Error(
+        `mesh_vertices.f32 大小不符：${buf.byteLength}B ≠ 预期 ${frames * vpf * 3 * 4}B`,
+      );
+    }
+    return buildF32Track(new Float32Array(buf), data.keyframes);
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.warn(
-      `[kineto] mesh 二进制加载失败（叠加模式回退旧路径）: ${String(err)}`,
-    );
+    console.warn(`[kineto] mesh 轨道加载失败: ${String(err)}`);
     return undefined;
   }
 }
@@ -122,10 +264,9 @@ export async function loadPoseData(
     try {
       const data = await fetchPoseData(jobId, signal);
       validatePoseData(data);
-      // [P1] mesh 二进制轨道：失败不阻塞骨架展示（meshTrack 为 undefined 时
-      // 渲染层自动回退旧 JSON 嵌入路径）。
-      const meshTrack = await loadMeshTrack(jobId, data, signal);
-      return { data, source: "api", meshTrack };
+      // [P1.1] mesh 轨道（DRACO 压缩，Funnel 低带宽下需数十秒）**不阻塞**
+      // 首屏：pose 就绪即渲染骨架，mesh 由 ViewerStage 后台 loadMeshTrack。
+      return { data, source: "api" };
     } catch (err) {
       const reason =
         err instanceof ApiError ? err.message : `API 加载失败: ${String(err)}`;

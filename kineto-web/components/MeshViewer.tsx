@@ -58,9 +58,9 @@ function SMPLMesh({
   showWireframe = false,
   targetSize = 2.4,
 }: Omit<MeshViewerProps, "showSkeleton">) {
-  // 轨道帧数与 keyframes 一致才视为有效（不一致回退嵌入路径）
-  const track =
-    meshTrack && meshTrack.frameCount === keyframes.length ? meshTrack : undefined;
+  // [P1.1] mesh 轨道可能异步到达（DRACO 后台加载）；track 存在即用，
+  // 采样走 meshTrack.times 独立时间轴，不要求 frameCount === keyframes.length。
+  const track = meshTrack;
 
   // 预计算：时间索引 + 全局居中/缩放
   const timeIndex = useMemo(() => buildTimeIndex(keyframes), [keyframes]);

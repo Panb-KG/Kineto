@@ -79,14 +79,26 @@ export interface PoseMetadata {
   has_mesh?: boolean;
   /**
    * [P1 mesh 节奏贴合] SMPL 顶点二进制文件名（additive，旧产物缺失）。
-   * 值为 "mesh_vertices.f32"（位于产物目录内，经 /api 代理拉取）；
+   * 值为 "mesh_track.drcs"（[P1.1] DRACO 压缩）或 "mesh_vertices.f32"
+   * （全帧 float32 回退格式），位于产物目录内经 /api 代理拉取；
    * 为 null/缺失时表示顶点走旧 JSON 嵌入格式（keyframes[].mesh_vertices）。
    */
   mesh_vertices_file?: string;
-  /** [P1] 二进制顶点轨道帧数（= keyframes.length，严格 1:1）。 */
+  /** [P1] 二进制顶点轨道帧数（draco 格式为抽帧后 mesh 帧数）。 */
   mesh_vertices_frames?: number;
   /** [P1] 每帧顶点数（SMPL 标准 6890）。 */
   mesh_vertices_per_frame?: number;
+  /**
+   * [P1.1] mesh 编码格式（additive）：
+   *   "draco14" → mesh_track.drcs（DRACO 14bit 量化 + KDRC 容器）；
+   *   "f32"     → mesh_vertices.f32（全帧 float32）。
+   */
+  mesh_encoding?: string;
+  /**
+   * [P1.1] mesh 帧抽帧步长：mesh 帧 k 对应 keyframes[k*mesh_frame_stride]
+   * （f32/嵌入格式为 1）。
+   */
+  mesh_frame_stride?: number;
 }
 
 /**
@@ -149,21 +161,25 @@ export const JOINT_ORDER_CANONICAL = "smpl-canonical";
 export type JobState = "queued" | "running" | "done" | "failed";
 
 /**
- * [P1 mesh 节奏贴合] SMPL 顶点二进制轨道。
+ * [P1 mesh 节奏贴合] SMPL 顶点轨道（与骨架时间轴对齐）。
  *
- * 由 mesh_vertices.f32 加载而来（帧数×vertexCount×3 float32 LE），与
- * keyframes **严格 1:1**（第 i 帧顶点对应 keyframes[i]），加载时已做
- * 相机系→世界系预翻转（y→-y, z→-z）。采样时对相邻帧线性插值——
- * J_regressor 为线性映射，顶点插值与 joints_3d 插值严格同步，
- * 叠加模式下骨架与 mesh 位置/节奏完全贴合。
+ * 来源两种：
+ *   - [P1.1] DRACO：mesh_track.drcs 解码而来，mesh 帧按 stride 抽帧
+ *     （frameCount < keyframes 数），times[k] = keyframes[k*stride].timestamp_ms；
+ *   - [P1] f32：mesh_vertices.f32，frameCount = keyframes 数（stride=1）。
+ * 两种来源加载时均已做相机系→世界系预翻转（y→-y, z→-z）。采样时对相邻
+ * mesh 帧线性插值——J_regressor 为线性映射，顶点插值与 joints_3d 插值同源
+ * 同步，叠加模式下骨架与 mesh 位置/节奏贴合。
  */
 export interface MeshTrack {
-  /** 帧数（= keyframes.length）。 */
+  /** mesh 帧数（draco 抽帧后 ≤ keyframes 数；f32 时相等）。 */
   frameCount: number;
   /** 每帧顶点数（SMPL 标准 6890）。 */
   vertexCount: number;
-  /** 预翻转后的顶点数据，长度 frameCount × vertexCount × 3。 */
+  /** 预翻转后的顶点数据，长度 frameCount × vertexCount × 3（世界系）。 */
   vertices: Float32Array;
+  /** 每个 mesh 帧对应的时间戳（ms）：times[k] = keyframes[k*stride].timestamp_ms。 */
+  times: Float64Array;
 }
 
 /**

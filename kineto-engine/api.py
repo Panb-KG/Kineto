@@ -35,6 +35,7 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
 logger = logging.getLogger("kineto.api")
@@ -645,6 +646,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*", "X-API-Key"],
 )
+# [P1.1] gzip 响应压缩：Funnel 中继带宽仅 ~40-130KB/s，pose_data.json 3.1MB
+# 未压缩需 ~75s。GZipMiddleware 自动压缩 application/json 等文本响应（JSON
+# 实测 3.1MB→约 1MB）；application/octet-stream（.drcs/.f32/.mp4）不压缩——
+# mesh 用 DRACO 已是熵编码，视频本身已压缩。
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 def require_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
@@ -922,12 +928,23 @@ def get_pose_data(job_id: str) -> FileResponse:
 
 @app.get("/jobs/{job_id}/mesh_vertices.f32", dependencies=[Depends(require_api_key)])
 def get_mesh_vertices(job_id: str) -> FileResponse:
-    """SMPL 顶点二进制（[P1 mesh 节奏贴合]：帧数×6890×3 float32 LE，与 keyframes 1:1）。
+    """SMPL 顶点二进制（[P1] 全帧 float32 LE：帧数×6890×3；f32 回退格式）。
 
     帧数/顶点数以 pose_data.json metadata 的 mesh_vertices_frames /
-    mesh_vertices_per_frame 为准。
+    mesh_vertices_per_frame 为准。新产物优先走 mesh_track.drcs（DRACO 压缩）。
     """
     return _serve_artifact(job_id, "mesh_vertices.f32")
+
+
+@app.get("/jobs/{job_id}/mesh_track.drcs", dependencies=[Depends(require_api_key)])
+def get_mesh_track(job_id: str) -> FileResponse:
+    """SMPL mesh DRACO 压缩轨道（[P1.1]：KDRC 容器，含 TOC + 逐帧 DRACO blob）。
+
+    mesh 帧按 metadata.mesh_frame_stride 抽帧（帧 k ↔ keyframes[k*stride]）；
+    帧数/顶点数/量化位宽以容器头与 metadata 的 mesh_vertices_frames /
+    mesh_vertices_per_frame 为准。已熵编码，不做 gzip。
+    """
+    return _serve_artifact(job_id, "mesh_track.drcs")
 
 
 @app.get("/jobs/{job_id}/demo_output.mp4", dependencies=[Depends(require_api_key)])

@@ -255,9 +255,11 @@ export function sampleJoints(
  * 对相邻两个关键帧做线性插值；时间越界时 clamp 到首/尾帧。
  * 若某帧缺少 mesh_vertices，则回退到最近有数据的关键帧。
  *
- * [P1 mesh 节奏贴合] 传入 meshTrack（全帧二进制轨道，与 keyframes 严格 1:1、
- * 已预翻转）时走直取路径：时间→帧下标二分后直接线性插值，不再扫描嵌入数据，
- * 节奏与 sampleJoints 严格同步（同一 times 数组、同一 frac）。
+ * [P1 mesh 节奏贴合] 传入 meshTrack（二进制轨道、已预翻转）时走直取路径。
+ * [P1.1] mesh 帧按 stride 抽帧（DRACO ~6.7fps），**独立时间轴**
+ * meshTrack.times 二分定位 + 线性插值——times[k] = keyframes[k*stride]
+ * 的 timestamp_ms，插值与 sampleJoints 共用同一播放头，节奏贴合
+ * （相邻 mesh 帧 150ms 间隔线性插值无可见顿挫）。
  */
 export function sampleMeshVertices(
   index: TimeIndex,
@@ -269,30 +271,34 @@ export function sampleMeshVertices(
   const n = keyframes.length;
   if (n === 0) return out;
 
-  // ── [P1] 全帧二进制轨道直取路径（顶点已预翻转，无需再变换）──
-  if (meshTrack && meshTrack.frameCount === n) {
-    const { vertices, vertexCount } = meshTrack;
-    const i = lowerIndex(times, timeMs);
-    const i2 = Math.min(i + 1, n - 1);
-    const t0 = times[i];
-    const t1 = times[i2];
-    const span = t1 - t0;
-    const frac = span > 1e-6 ? (timeMs - t0) / span : 0;
+  // ── [P1/P1.1] 二进制轨道直取路径（顶点已预翻转，无需再变换）──
+  if (meshTrack) {
+    const { vertices, vertexCount, times: mt } = meshTrack;
+    const mf = meshTrack.frameCount;
+    if (mf > 0) {
+      // mesh 帧独立时间轴二分（mt 单调不减，抽帧 stride≥1）
+      let i = lowerIndex(mt, timeMs);
+      let i2 = Math.min(i + 1, mf - 1);
+      const t0 = mt[i];
+      const t1 = mt[i2];
+      const span = t1 - t0;
+      const frac = span > 1e-6 ? (timeMs - t0) / span : 0;
 
-    const count = Math.min(vertexCount, out.length / 3);
-    const baseA = i * vertexCount * 3;
-    const baseB = i2 * vertexCount * 3;
-    for (let k = 0; k < count; k++) {
-      const a3 = baseA + k * 3;
-      const b3 = baseB + k * 3;
-      const ax = vertices[a3];
-      const ay = vertices[a3 + 1];
-      const az = vertices[a3 + 2];
-      out[k * 3] = ax + (vertices[b3] - ax) * frac;
-      out[k * 3 + 1] = ay + (vertices[b3 + 1] - ay) * frac;
-      out[k * 3 + 2] = az + (vertices[b3 + 2] - az) * frac;
+      const count = Math.min(vertexCount, out.length / 3);
+      const baseA = i * vertexCount * 3;
+      const baseB = i2 * vertexCount * 3;
+      for (let k = 0; k < count; k++) {
+        const a3 = baseA + k * 3;
+        const b3 = baseB + k * 3;
+        const ax = vertices[a3];
+        const ay = vertices[a3 + 1];
+        const az = vertices[a3 + 2];
+        out[k * 3] = ax + (vertices[b3] - ax) * frac;
+        out[k * 3 + 1] = ay + (vertices[b3 + 1] - ay) * frac;
+        out[k * 3 + 2] = az + (vertices[b3 + 2] - az) * frac;
+      }
+      return out;
     }
-    return out;
   }
 
   // ── 旧 JSON 嵌入路径（fixture / 旧 16 帧产物兼容）──
@@ -355,14 +361,15 @@ export function sampleMeshVertices(
  * 计算 mesh 顶点的居中/缩放变换（与 computeFraming 类似，但基于 mesh 顶点）。
  * [P1] 传入 meshTrack 时直接在预翻转二进制上扫全帧包围盒（一次 O(帧数×6890)，
  * 播放期零开销），语义与旧路径一致（全帧并集，动画不漂移）。
+ * [P1.1] DRACO 轨道为抽帧，frameCount 可小于 keyframes 数，不影响包围盒语义。
  */
 export function computeMeshFraming(
   keyframes: Keyframe[],
   targetSize = 2.4,
   meshTrack?: MeshTrack,
 ): FrameTransform {
-  // ── [P1] 全帧二进制轨道路径 ──
-  if (meshTrack && meshTrack.frameCount === keyframes.length) {
+  // ── [P1/P1.1] 二进制轨道路径（已预翻转；抽帧同样覆盖全程动作）──
+  if (meshTrack && meshTrack.frameCount > 0) {
     return framingFromFlatArray(meshTrack.vertices, targetSize);
   }
 

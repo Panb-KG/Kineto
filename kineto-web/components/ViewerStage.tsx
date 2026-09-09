@@ -16,10 +16,11 @@ import MetadataPanel from "./MetadataPanel";
 import TimelineControls from "./TimelineControls";
 import KeyframeCards from "./KeyframeCards";
 import VideoCompare, { AnalysisVideo } from "./VideoCompare";
-import { loadPoseData, type LoadedPoseData } from "../lib/poseData";
+import { loadPoseData, loadMeshTrack, type LoadedPoseData } from "../lib/poseData";
 import { getJob } from "../lib/api";
 import { useTimeline } from "../lib/useTimeline";
 import { useVideoSync } from "../lib/useVideoSync";
+import type { MeshTrack } from "../lib/types";
 
 const SkeletonViewer = dynamic(() => import("./SkeletonViewer"), {
   ssr: false,
@@ -170,6 +171,9 @@ export default function ViewerStage({ jobId }: ViewerStageProps) {
   );
 }
 
+/** mesh 轨道后台加载状态（[P1.1] DRACO 压缩产物异步加载，不阻塞骨架）。 */
+type MeshLoadState = "idle" | "loading" | "ready" | "failed";
+
 /** 数据就绪后的实际渲染（独立组件以便安全调用 useTimeline）。 */
 function ReadyStage({
   loaded,
@@ -180,22 +184,64 @@ function ReadyStage({
   degraded?: boolean;
   jobId?: string;
 }) {
-  const { data, source, fallbackReason, meshTrack } = loaded;
+  const { data, source, fallbackReason } = loaded;
   const keyframes = useMemo(() => data.keyframes, [data]);
   const { timeline, playing, durationMs, toggle } = useTimeline(keyframes, true);
 
   // 视频同步 Hook：模型动图与解析动图联动
   const videoSync = useVideoSync();
 
+  // [P1.1] mesh 轨道后台异步加载：pose 就绪即渲染骨架，mesh（DRACO 压缩，
+  // Funnel 低带宽下需数十秒）到达后无缝切换；失败仅提示不阻塞。
+  const [meshTrack, setMeshTrack] = useState<MeshTrack | undefined>(undefined);
+  const [meshState, setMeshState] = useState<MeshLoadState>("idle");
+
+  useEffect(() => {
+    // 旧 JSON 嵌入格式（fixture）无需后台加载
+    if (!jobId || source !== "api" || !data.metadata.mesh_vertices_file) {
+      setMeshState("idle");
+      return;
+    }
+    const controller = new AbortController();
+    let active = true;
+    setMeshState("loading");
+    loadMeshTrack(jobId, data, controller.signal)
+      .then((track) => {
+        if (!active) return;
+        if (track) {
+          setMeshTrack(track);
+          setMeshState("ready");
+        } else {
+          setMeshState("failed");
+        }
+      })
+      .catch(() => {
+        if (active) setMeshState("failed");
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [jobId, source, data]);
+
   // 检查是否有 mesh 数据
-  // [P1 mesh 节奏贴合] 二进制轨道（API 产物）或旧 JSON 嵌入顶点（fixture）
-  // 任一存在即可；faces 仍从 pose_data.json 根级读取（两种格式一致）。
+  // [P1.1] hasMesh 与 meshTrack 是否已加载**解耦**：基于元数据与面表判定，
+  // 保证三态切换按钮始终可见；二进制轨道后台加载期间 mesh 视图显示加载提示。
+  const hasEmbeddedMesh = keyframes.some(
+    (kf) => kf.mesh_vertices !== undefined && kf.mesh_vertices.length > 0,
+  );
+  const hasBinaryMesh = data.metadata.mesh_vertices_file !== undefined;
   const hasMesh =
     data.metadata.has_mesh === true &&
     data.mesh_faces !== undefined &&
     data.mesh_faces.length > 0 &&
-    (meshTrack !== undefined ||
-      keyframes.some((kf) => kf.mesh_vertices && kf.mesh_vertices.length > 0));
+    (hasEmbeddedMesh || hasBinaryMesh);
+
+  // 二进制 mesh 尚在加载 / 加载失败（嵌入格式无此状态）
+  const meshPending =
+    hasBinaryMesh && !hasEmbeddedMesh && meshState === "loading";
+  const meshFailed =
+    hasBinaryMesh && !hasEmbeddedMesh && meshState === "failed";
 
   // 视图模式切换（默认骨架，有 mesh 数据时可选）
   const [viewMode, setViewMode] = useState<ViewMode>("skeleton");
@@ -305,6 +351,20 @@ function ReadyStage({
               meshTrack={meshTrack}
               showWireframe={showWireframe}
             />
+          )}
+
+          {/* [P1.1] 二进制 mesh 后台加载中 / 失败遮罩（骨架与播放不受影响） */}
+          {(viewMode === "mesh" || viewMode === "both") && meshPending && (
+            <div className="stage-status viewer-mesh-status" role="status">
+              <div className="spinner" aria-hidden />
+              <p>Mesh 模型加载中…（首次加载经压缩传输，请稍候）</p>
+            </div>
+          )}
+          {(viewMode === "mesh" || viewMode === "both") && meshFailed && (
+            <div className="stage-status stage-status--error viewer-mesh-status" role="alert">
+              <strong>Mesh 加载失败</strong>
+              <p>骨架视图不受影响，可按 M 切回骨架模式。</p>
+            </div>
           )}
 
           {/* 视图模式切换按钮 */}

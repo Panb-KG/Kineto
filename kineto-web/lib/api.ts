@@ -134,7 +134,35 @@ export async function fetchPoseData(
 }
 
 /**
- * [P1 mesh 节奏贴合] 拉取 SMPL 顶点二进制（mesh_vertices.f32）。
+ * [P1.1] 拉取 SMPL mesh 产物二进制（mesh_track.drcs / mesh_vertices.f32）。
+ *
+ * 文件名由 metadata.mesh_vertices_file 指定，经同源 /api 代理流式中转。
+ * DRACO 压缩格式（~3MB/466帧）适配 Funnel 中继低带宽；f32 为回退格式。
+ * 返回原始 ArrayBuffer，由调用方按 metadata.mesh_encoding 解码。
+ */
+export async function fetchMeshTrackFile(
+  jobId: string,
+  fileName: string,
+  signal?: AbortSignal,
+): Promise<ArrayBuffer> {
+  const url = `${API_BASE}/jobs/${encodeURIComponent(jobId)}/${encodeURIComponent(fileName)}`;
+  let res: Response;
+  try {
+    res = await fetch(url, { signal, cache: "no-store" });
+  } catch (err) {
+    throw new ApiError(`无法连接后端: ${url}`, undefined, err);
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      await reasonFromResponse(res, `获取 ${fileName} 失败 (${res.status})`),
+      res.status,
+    );
+  }
+  return res.arrayBuffer();
+}
+
+/**
+ * [P1 mesh 节奏贴合] 拉取 SMPL 顶点二进制（mesh_vertices.f32，全帧回退格式）。
  *
  * 布局：帧数×vertexCount×3 float32 LE（相机系坐标），与 keyframes 1:1。
  * 字节数不符时抛错（契约被破坏不应静默渲染错数据）。
@@ -145,20 +173,7 @@ export async function fetchMeshVerticesRaw(
   vertexCount: number,
   signal?: AbortSignal,
 ): Promise<Float32Array> {
-  const url = `${API_BASE}/jobs/${encodeURIComponent(jobId)}/mesh_vertices.f32`;
-  let res: Response;
-  try {
-    res = await fetch(url, { signal, cache: "no-store" });
-  } catch (err) {
-    throw new ApiError(`无法连接后端: ${url}`, undefined, err);
-  }
-  if (!res.ok) {
-    throw new ApiError(
-      await reasonFromResponse(res, `获取 mesh_vertices.f32 失败 (${res.status})`),
-      res.status,
-    );
-  }
-  const buf = await res.arrayBuffer();
+  const buf = await fetchMeshTrackFile(jobId, "mesh_vertices.f32", signal);
   const expected = frameCount * vertexCount * 3 * 4;
   if (buf.byteLength !== expected) {
     throw new ApiError(

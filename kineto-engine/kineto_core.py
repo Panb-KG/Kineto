@@ -54,6 +54,122 @@ EXIT_STRICT_REFUSED = 3
 
 
 # ============================================================================
+# [P1.1 mesh 传输压缩] DRACO 编码
+# ----------------------------------------------------------------------------
+# 背景：公网入口走 Tailscale Funnel 中继，实测带宽仅 ~40-130KB/s；P1 的全帧
+# f32 mesh（466 帧 ≈ 38.5MB）经 Funnel 需 5-15 分钟，浏览器必然超时 → mesh
+# 模式整体不可用。DRACO 连通性感知压缩 + 时间抽帧：
+#   • 14bit 量化（bbox≈1.8m → 量化步长 ~0.03mm，实测误差 <0.1mm，视觉无损）；
+#   • stride=3：mesh 6.7fps（骨架仍全帧 20fps 关键帧、前端 60fps 线性插值），
+#     mesh 相邻帧 150ms 线性插值在康复动作节奏下无可见顿挫（旧痛点是 16 帧/23s
+#     = 0.7fps 且不插值的「跳变」）；
+#   → 466 帧视频 mesh 产物约 3MB（vs 38.5MB）。
+# DRACO 连通性感知压缩会按连通性遍历**重排顶点编号**（面表也可能重排），
+# 解码顺序对同一套 faces 跨帧确定性一致（实测解码 faces 逐帧完全相同）。
+# 引擎在编码后立即解码首帧，用 3D 最近点匹配（量化误差 <0.1mm ≪ 最小顶点
+# 间距 ~1mm）求出 orig→dec 排列 perm 并写入容器头，消费方（前端/G14）
+# 直接套用 perm 还原 SMPL 原始顶点序——不依赖任何「面序/绕序保持」假设；
+# 引擎同时断言三角形多重集一致（排列正确性的独立验证）。
+# DracoPy 缺失/编码失败时调用方回退全帧 f32（局域网/大带宽环境仍可用）。
+# ============================================================================
+MESH_DRACO_QUANT_BITS = 14
+MESH_FRAME_STRIDE = 3
+_MESH_DRC_MAGIC = b"KDRC"
+_MESH_DRC_VERSION = 2
+# 最近点匹配容差（米）：14bit 量化步长 ~0.03mm、实测最大误差 0.041mm；
+# SMPL 网格最小顶点间距毫米级，1mm 阈值既能容忍量化又足以拒绝错误匹配。
+_MESH_PERM_MATCH_TOL_M = 1e-3
+
+
+def encode_mesh_track_drcs(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    stride: int = MESH_FRAME_STRIDE,
+    quant_bits: int = MESH_DRACO_QUANT_BITS,
+) -> tuple[bytes, int]:
+    """全帧顶点 (F,V,3) + 面索引 → KDRC 容器字节、mesh 帧数。
+
+    容器布局 v2（小端）：
+      magic 4B(b"KDRC") | version u16(=2) | quant_bits u16 |
+      frame_count u32 | verts_per_frame u32 | stride u32 |
+      perm u32[verts_per_frame]（perm[orig_v] = dec_v，orig→dec 排列）|
+      offsets u32[frame_count]（自文件起始的字节偏移）|
+      DRACO blob 顺序拼接。
+    mesh 帧 k 对应原始 keyframes[k*stride]。
+    """
+    import DracoPy  # 惰性导入：缺失时由调用方回退 f32
+
+    frame_idx = list(range(0, vertices.shape[0], stride))
+    faces_u32 = np.ascontiguousarray(faces, dtype=np.uint32)
+    faces_i64 = np.asarray(faces, dtype=np.int64)
+    vpf = int(vertices.shape[1])
+
+    blobs: list[bytes] = []
+    for fi in frame_idx:
+        blob = DracoPy.encode(
+            points=np.ascontiguousarray(vertices[fi], dtype=np.float64),
+            faces=faces_u32,
+            quantization_bits=quant_bits,
+            compression_level=7,
+        )
+        blobs.append(bytes(blob))
+
+    # ── 求 orig→dec 顶点排列（仅首帧；跨帧确定性一致）──
+    dec0 = DracoPy.decode(blobs[0])
+    pts_dec = np.asarray(dec0.points, dtype=np.float64)
+    faces_dec = np.asarray(dec0.faces, dtype=np.int64)
+    if pts_dec.shape != (vpf, 3):
+        raise RuntimeError(f"DRACO 首帧解码顶点形状异常: {pts_dec.shape} != ({vpf}, 3)")
+    pts_orig0 = np.asarray(vertices[frame_idx[0]], dtype=np.float64)
+
+    perm = np.empty(vpf, dtype=np.int64)
+    nearest = np.empty(vpf, dtype=np.float64)
+    chunk = 512  # 分块计算距离矩阵，避免 6890²×3 的临时内存
+    for s in range(0, vpf, chunk):
+        e = min(s + chunk, vpf)
+        d = np.linalg.norm(pts_orig0[s:e, None, :] - pts_dec[None, :, :], axis=2)
+        idx = d.argmin(axis=1)
+        perm[s:e] = idx
+        nearest[s:e] = d[np.arange(e - s), idx]
+    if float(nearest.max()) > _MESH_PERM_MATCH_TOL_M:
+        raise RuntimeError(
+            f"DRACO 顶点排列匹配残差 {nearest.max() * 1000:.3f}mm "
+            f"> 容差 {_MESH_PERM_MATCH_TOL_M * 1000:.1f}mm（量化异常或网格错配）"
+        )
+    if len(set(perm.tolist())) != vpf:
+        raise RuntimeError("DRACO 顶点排列非双射（最近点匹配出现重复目标）")
+
+    # 独立验证：orig 面表经 perm 映射后的三角形多重集必须与解码面表一致
+    def _canon_tris(tris: np.ndarray) -> np.ndarray:
+        s = np.sort(tris, axis=1)
+        return s[np.lexsort((s[:, 2], s[:, 1], s[:, 0]))]
+
+    mapped_faces = perm[faces_i64]
+    if not np.array_equal(_canon_tris(mapped_faces), _canon_tris(faces_dec)):
+        raise RuntimeError("DRACO 排列自验失败：映射后面表与解码面表不一致")
+
+    header_len = 4 + 2 + 2 + 4 + 4 + 4 + 4 * vpf + 4 * len(blobs)
+    offsets: list[int] = []
+    cursor = header_len
+    for b in blobs:
+        offsets.append(cursor)
+        cursor += len(b)
+
+    parts = [
+        _MESH_DRC_MAGIC,
+        np.uint16(_MESH_DRC_VERSION).astype("<u2").tobytes(),
+        np.uint16(quant_bits).astype("<u2").tobytes(),
+        np.uint32(len(blobs)).astype("<u4").tobytes(),
+        np.uint32(vpf).astype("<u4").tobytes(),
+        np.uint32(stride).astype("<u4").tobytes(),
+        np.asarray(perm, dtype="<u4").tobytes(),
+        np.asarray(offsets, dtype="<u4").tobytes(),
+    ]
+    parts.extend(blobs)
+    return b"".join(parts), len(blobs)
+
+
+# ============================================================================
 # 设备自适应检测
 # ============================================================================
 
@@ -1862,24 +1978,42 @@ def _process_video_impl(stack, input_path, output_dir, device,
     else:
         pose_info = {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
 
-    # ---- SMPL Mesh 计算（全帧，顶点写独立二进制）----
-    # [P1 mesh 节奏贴合] 旧实现 MESH_FRAME_BUDGET=16 均匀采样嵌入 JSON：叠加
-    # 模式下 mesh 每 ~1.7s 才动一次，与骨架全帧 60fps 插值节奏必然脱节；且
-    # 全帧嵌入 JSON 约 150MB 不可行。改为**全帧** SMPL forward（J_regressor
-    # 线性性保证：顶点相邻帧线性插值与 joints_3d 线性插值严格同步，叠加模式
-    # 位置/节奏完全贴合），顶点写独立二进制 mesh_vertices.f32
-    # （帧数×6890×3 float32 LE，466 帧约 38.5MB），JSON 不再嵌入顶点。
-    mesh_bin_name = "mesh_vertices.f32"
+    # ---- SMPL Mesh 计算（全帧 forward；交付用 DRACO 压缩二进制）----
+    # [P1 mesh 节奏贴合] 全帧 SMPL forward（J_regressor 线性性保证：顶点相邻帧
+    # 线性插值与 joints_3d 线性插值严格同步）。
+    # [P1.1 传输压缩] 交付编码：DRACO 14bit + stride3（mesh_track.drcs，466 帧
+    # 视频约 3MB，适配 Funnel 中继 ~40-130KB/s 的现实带宽）；DracoPy 缺失时
+    # 回退全帧 f32（~38MB，局域网环境可用）。两种格式 JSON 均不嵌入顶点。
     mesh_result = extractor.compute_mesh_for_keyframes(keyframes)
+    mesh_file_name: str | None = None
+    mesh_encoding: str | None = None
     mesh_frames = 0
     mesh_vertex_count = 0
+    mesh_frame_stride = 1
     if mesh_result["has_mesh"]:
         verts_arr = np.asarray(mesh_result["mesh_vertices"], dtype=np.float32)
-        mesh_frames, mesh_vertex_count = int(verts_arr.shape[0]), int(verts_arr.shape[1])
-        verts_arr.tofile(output_path / mesh_bin_name)
-        print(f"[Mesh] ✓ 计算完成：{mesh_frames} 帧 × {mesh_vertex_count} 顶点, "
-              f"{len(mesh_result['faces'])} 面 → {mesh_bin_name}"
-              f"（{verts_arr.nbytes / 1e6:.1f}MB）")
+        full_mesh_frames, mesh_vertex_count = int(verts_arr.shape[0]), int(verts_arr.shape[1])
+        faces_arr = np.asarray(mesh_result["faces"], dtype=np.uint32)
+        try:
+            buf, drc_frames = encode_mesh_track_drcs(verts_arr, faces_arr)
+            mesh_file_name = "mesh_track.drcs"
+            (output_path / mesh_file_name).write_bytes(buf)
+            mesh_encoding = f"draco{MESH_DRACO_QUANT_BITS}"
+            mesh_frame_stride = MESH_FRAME_STRIDE
+            mesh_frames = drc_frames  # 抽帧后的 mesh 帧数
+            print(f"[Mesh] ✓ DRACO 编码完成：{drc_frames} mesh 帧"
+                  f"（stride={MESH_FRAME_STRIDE}，{MESH_DRACO_QUANT_BITS}bit）"
+                  f"× {mesh_vertex_count} 顶点, {len(faces_arr)} 面 → {mesh_file_name}"
+                  f"（{len(buf) / 1e6:.1f}MB / 全帧 f32 {verts_arr.nbytes / 1e6:.1f}MB）")
+        except Exception as exc:
+            print(f"[Mesh] ⚠️  DRACO 编码失败（回退全帧 f32）: {exc}", file=sys.stderr)
+            mesh_file_name = "mesh_vertices.f32"
+            verts_arr.tofile(output_path / mesh_file_name)
+            mesh_encoding = "f32"
+            mesh_frame_stride = 1
+            mesh_frames = full_mesh_frames
+            print(f"[Mesh] ✓ 全帧 f32：{mesh_frames} 帧 × {mesh_vertex_count} 顶点"
+                  f" → {mesh_file_name}（{verts_arr.nbytes / 1e6:.1f}MB）")
     else:
         print("[Mesh] 无 mesh（fallback 模式或计算失败）")
 
@@ -1904,11 +2038,17 @@ def _process_video_impl(stack, input_path, output_dir, device,
         # 四宫格教学图
         "grid_images": grid_result["grid_images"],
         "grid_labels": grid_result["grid_labels"],
-        # SMPL mesh（[P1] 顶点在独立二进制 mesh_vertices.f32，与 keyframes 1:1）
+        # SMPL mesh（[P1.1] 顶点在独立压缩二进制，JSON 不嵌入）：
+        #   mesh_vertices_file：产物文件名（mesh_track.drcs | mesh_vertices.f32）
+        #   mesh_encoding："draco14"（DRACO 压缩，mesh 帧按 stride 抽帧）| "f32"
+        #   mesh_vertices_frames：mesh 帧数（draco 时为抽帧后数量）
+        #   mesh_frame_stride：mesh 帧 k ↔ keyframes[k*stride]（f32 时为 1）
         "has_mesh": mesh_result["has_mesh"],
         "mesh_vertices_per_frame": mesh_vertex_count,
         "mesh_vertices_frames": mesh_frames,
-        "mesh_vertices_file": mesh_bin_name if mesh_frames > 0 else None,
+        "mesh_vertices_file": mesh_file_name,
+        "mesh_encoding": mesh_encoding,
+        "mesh_frame_stride": mesh_frame_stride,
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,

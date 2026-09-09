@@ -46,6 +46,11 @@ const HOP_BY_HOP = new Set([
   "upgrade",
   // 流式透传时长度由传输编码决定，转发原始 content-length 可能造成不匹配。
   "content-length",
+  // [P1.1] 引擎 GZipMiddleware 压缩 JSON；Node fetch(undici) 会自动解压
+  // upstream.body 但不自动删 content-encoding 头——若透传该头，浏览器会把
+  // 已解压的明文 body 再当 gzip 解压导致 JSON 解析失败。Funnel 慢段
+  // （引擎→Zeabur）仍保持压缩，此处剥离只影响 Zeabur→浏览器段。
+  "content-encoding",
 ]);
 
 interface ProxyResult {
@@ -67,9 +72,9 @@ function isAllowedRoute(method: string, path: string[]): boolean {
     if (
       p.length === 3 &&
       p[0] === "jobs" &&
-      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4" || p[2] === "annotated_output.mp4" || p[2] === "mesh_vertices.f32" || /^grid_\d{2}\.jpg$/.test(p[2]))
+      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4" || p[2] === "annotated_output.mp4" || p[2] === "mesh_vertices.f32" || p[2] === "mesh_track.drcs" || /^grid_\d{2}\.jpg$/.test(p[2]))
     ) {
-      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4|annotated_output.mp4|mesh_vertices.f32|grid_XX.jpg}
+      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4|annotated_output.mp4|mesh_track.drcs|mesh_vertices.f32|grid_XX.jpg}
     }
   }
   return false;

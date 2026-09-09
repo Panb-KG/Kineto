@@ -74,9 +74,9 @@ function SMPLMesh({
   scale: number;
   timeIndex: ReturnType<typeof buildTimeIndex>;
 }) {
-  // 轨道帧数与 keyframes 一致才视为有效（不一致回退嵌入路径）
-  const track =
-    meshTrack && meshTrack.frameCount === keyframes.length ? meshTrack : undefined;
+  // [P1.1] track 可能异步到达（DRACO 后台加载）；存在即用，采样走
+  // meshTrack.times 独立时间轴，不要求 frameCount === keyframes.length。
+  const track = meshTrack;
 
   const vertexBuffer = useRef<Float32Array>(
     new Float32Array(MESH_VERTEX_COUNT * 3),

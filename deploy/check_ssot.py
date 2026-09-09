@@ -624,6 +624,59 @@ def _find_pose_data_with_mesh(engine_dir: Path) -> Path | None:
     return None
 
 
+def _decode_drcs_track(bin_path: Path, data: dict, vertex_count: int):
+    """解析 KDRC v2 容器并把 DRACO 解码顶点还原到 SMPL 原始顶点序。
+
+    DRACO 连通性感知压缩会重排顶点编号；容器头内携带引擎在编码时通过
+    3D 最近点匹配求出的 orig→dec 排列 perm（perm[orig_v]=dec_v），
+    消费方直接 gather 回原始序，不依赖面序/绕序假设。
+
+    返回 (verts_all (F,V,3) float64, stride)；失败返回 (None, 错误信息)。
+    """
+    import struct
+    try:
+        import DracoPy
+    except Exception as exc:  # noqa: BLE001 - 无 DracoPy（如纯 Mac 系统 python）
+        return None, f"DracoPy 不可用（{type(exc).__name__}: {exc}）→ SKIP（需引擎 venv 运行）"
+    import numpy as np
+
+    try:
+        raw = bin_path.read_bytes()
+        if raw[:4] != b"KDRC":
+            return None, f"{bin_path.name} magic 非 KDRC（文件损坏或非本管线产物）"
+        version, bits, fcount, vpf, stride = struct.unpack("<HHIII", raw[4:20])
+        if version < 2:
+            return None, (f"KDRC v{version} 容器不含顶点排列（v1 为开发期格式，"
+                          "请用当前引擎重新生成产物）")
+        if vpf != vertex_count or fcount <= 0:
+            return None, f"容器头异常：frame_count={fcount} vpf={vpf} stride={stride}"
+
+        perm = np.frombuffer(raw, dtype="<u4", count=vpf, offset=20).astype(np.int64)
+        off_pos = 20 + 4 * vpf
+        offsets = np.frombuffer(raw, dtype="<u4", count=fcount, offset=off_pos).astype(np.int64)
+        header_len = off_pos + 4 * fcount
+        if len(raw) < header_len:
+            return None, "容器头截断"
+        if len(set(perm.tolist())) != vpf or int(perm.min()) < 0 or int(perm.max()) >= vpf:
+            return None, "容器头 perm 非双射（文件损坏）"
+        bounds = list(offsets[1:]) + [len(raw)]
+
+        inv = np.empty(vpf, dtype=np.int64)  # inv[dec_v] = orig_v
+        inv[perm] = np.arange(vpf)
+        verts_all = np.zeros((fcount, vpf, 3), dtype=np.float64)
+
+        for k, (off, end) in enumerate(zip(offsets, bounds)):
+            mesh = DracoPy.decode(raw[int(off):int(end)])
+            pts = np.asarray(mesh.points, dtype=np.float64)
+            if pts.shape != (vpf, 3):
+                return None, f"帧 {k} 解码形状异常 pts={pts.shape}"
+            verts_all[k][inv] = pts  # gather 回 SMPL 原始顶点序
+
+        return (verts_all, int(stride)), None
+    except Exception as exc:  # noqa: BLE001 - 解码/解析任何失败都判失败
+        return None, f"DRACO 解码异常（{type(exc).__name__}: {exc}）"
+
+
 def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, rep: Report) -> None:
     """G14：对产物 pose_data.json 断言 mesh 顶点与 joints_3d 同坐标（叠加模式贴合性）。
 
@@ -631,11 +684,12 @@ def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, r
     逐关节比较。引擎 [P0 mesh↔joints 对齐] 保证两者按构造重合（残差 ≈0），
     故超阈值即判产物漂移（旧管线生成）。
 
-    两条数据路径：
-      - [P1] 二进制优先：metadata.mesh_vertices_file（mesh_vertices.f32，
-        帧数×6890×3 float32 LE，与 keyframes 1:1）→ **全帧**断言（einsum）；
+    数据路径（按年代）：
+      - [P1.1] DRACO：mesh_track.drcs（14bit 量化 + stride 抽帧），解码还原
+        原始顶点序后，mesh 帧 k 对照 keyframes[k*stride] 断言；
+      - [P1] f32：mesh_vertices.f32（帧数×6890×3 float32 LE，与 keyframes 1:1）；
       - 兼容旧产物：keyframes 内嵌 mesh_vertices（16 帧采样期格式）逐帧断言。
-    无产物 / 无 mesh / J_regressor 不可用时 SKIP（不影响退出码）。
+    无产物 / 无 mesh / J_regressor 不可用 / DracoPy 缺失时 SKIP（不影响其他闸门）。
     """
     if pose_data_path is None:
         rep.warn("G14 未找到产物 pose_data.json（output_test/output_closed/output 均缺失）→ SKIP")
@@ -668,40 +722,67 @@ def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, r
 
     j_reg = np.asarray(j_regressor, dtype=np.float64).reshape(NUM_JOINTS, -1)
 
-    # ---- [P1] 二进制路径（全帧断言）----
+    # ---- [P1.1]/[P1] 二进制路径（DRACO 压缩 或 f32 全帧）----
     meta = data.get("metadata", {})
     bin_rel = meta.get("mesh_vertices_file")
     frames_n = int(meta.get("mesh_vertices_frames") or 0)
     vertex_count = int(meta.get("mesh_vertices_per_frame") or 0)
+    encoding = str(meta.get("mesh_encoding") or "")
     if bin_rel and frames_n > 0 and vertex_count > 0:
         bin_path = pose_data_path.parent / bin_rel
         if not bin_path.exists():
             rep.error(f"G14 metadata 声明 {bin_rel} 但文件缺失（产物不完整）")
             return
-        expected = frames_n * vertex_count * 3 * 4
-        raw = bin_path.read_bytes()
-        if len(raw) != expected:
-            rep.error(f"G14 {bin_rel} 大小 {len(raw)}B ≠ 预期 {expected}B"
-                      f"（{frames_n}×{vertex_count}×3×float32）")
-            return
         keyframes = data.get("keyframes", [])
-        if len(keyframes) != frames_n:
-            rep.error(f"G14 二进制帧数 {frames_n} 与 keyframes 数 {len(keyframes)} 不一致"
-                      f"（1:1 契约被破坏，前端节奏映射将错位）")
-            return
-        verts_all = np.frombuffer(raw, dtype="<f4").reshape(frames_n, vertex_count, 3)
+
+        if encoding.startswith("draco"):
+            # [P1.1] DRACO 压缩轨道：解码还原原始顶点序；mesh 帧 k ↔ keyframes[k*stride]
+            result, err = _decode_drcs_track(bin_path, data, vertex_count)
+            if result is None:
+                # DracoPy 缺失类环境问题 → SKIP（Mac 本地无 DracoPy）；
+                # 容器损坏/排列不自洽类产物问题 → FAIL。
+                (rep.warn if "DracoPy 不可用" in (err or "") else rep.error)(
+                    f"G14 DRACO 轨道校验失败：{err}")
+                return
+            verts_all, stride = result
+            if verts_all.shape[0] != frames_n:
+                rep.error(f"G14 容器帧数 {verts_all.shape[0]} 与 metadata {frames_n} 不一致")
+                return
+            ref_kfs = keyframes[::stride][:frames_n]
+            if len(ref_kfs) != frames_n:
+                rep.error(f"G14 stride={stride} 抽取的关键帧数 {len(ref_kfs)} "
+                          f"≠ mesh 帧数 {frames_n}（节奏映射契约破坏）")
+                return
+            tag = f"[P1.1] DRACO {encoding} stride{stride}"
+        else:
+            # [P1] f32 全帧（DracoPy 缺失时的回退格式），与 keyframes 1:1
+            expected = frames_n * vertex_count * 3 * 4
+            raw = bin_path.read_bytes()
+            if len(raw) != expected:
+                rep.error(f"G14 {bin_rel} 大小 {len(raw)}B ≠ 预期 {expected}B"
+                          f"（{frames_n}×{vertex_count}×3×float32）")
+                return
+            if len(keyframes) != frames_n:
+                rep.error(f"G14 二进制帧数 {frames_n} 与 keyframes 数 {len(keyframes)} 不一致"
+                          f"（1:1 契约被破坏，前端节奏映射将错位）")
+                return
+            verts_all = np.frombuffer(raw, dtype="<f4").reshape(frames_n, vertex_count, 3)
+            ref_kfs = keyframes
+            stride = 1
+            tag = "[P1] f32 全帧"
+
         if verts_all.shape[1] != j_reg.shape[1]:
             rep.error(f"G14 顶点数 {vertex_count} 与 J_regressor 列数 {j_reg.shape[1]} 不一致")
             return
-        refs = np.asarray([k["joints_3d"] for k in keyframes], dtype=np.float64)
+        refs = np.asarray([k["joints_3d"] for k in ref_kfs], dtype=np.float64)
         fk = np.einsum("jv,fvc->fjc", j_reg, verts_all.astype(np.float64))
         err_mm = np.linalg.norm(fk - refs, axis=2) * 1000.0    # (F, 24)
         max_err = float(err_mm.max())
         mean_err = float(err_mm.mean())
         worst_flat = int(err_mm.argmax())
-        worst_frame = int(keyframes[worst_flat // NUM_JOINTS].get("frame_index", -1))
+        worst_frame = int(ref_kfs[worst_flat // NUM_JOINTS].get("frame_index", -1))
         if max_err <= _MESH_JOINTS_TOL_MM:
-            rep.ok(f"G14 mesh↔joints 一致（[P1] 二进制全帧）：{frames_n} 帧全部在容差内"
+            rep.ok(f"G14 mesh↔joints 一致（{tag}）：{frames_n} 帧全部在容差内"
                    f"（mean {mean_err:.2f}mm / max {max_err:.2f}mm ≤ {_MESH_JOINTS_TOL_MM}mm）")
         else:
             rep.drift(f"G14 mesh↔joints 错位：max {max_err:.2f}mm（帧 {worst_frame}）"
