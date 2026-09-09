@@ -21,7 +21,9 @@ import type { PoseTimeline } from "../lib/timeline";
 import {
   buildTimeIndex,
   computeMeshFraming,
+  computeSpineOrientation,
   sampleMeshVertices,
+  applyRotationToJoints,
 } from "../lib/timeline";
 import type { Keyframe, Vec3 } from "../lib/types";
 import { MESH_VERTEX_COUNT } from "../lib/types";
@@ -57,6 +59,11 @@ function SMPLMesh({
   const framing = useMemo(
     () => computeMeshFraming(keyframes, targetSize),
     [keyframes, targetSize],
+  );
+  // Spine 朝向校正四元数（横卧视频 → 直立）
+  const spineQuat = useMemo(
+    () => computeSpineOrientation(keyframes),
+    [keyframes],
   );
 
   // 顶点缓冲区（复用，避免每帧 GC）
@@ -103,6 +110,8 @@ function SMPLMesh({
   useFrame(() => {
     const ms = timeline.getMs();
     sampleMeshVertices(timeIndex, ms, vertexBuffer.current);
+    // 应用 spine 朝向校正（横卧视频 → 直立）
+    applyRotationToJoints(vertexBuffer.current, spineQuat);
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const arr = posAttr.array as Float32Array;

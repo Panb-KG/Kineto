@@ -167,6 +167,150 @@ export class PoseTimeline {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Spine 朝向校正
+// ───────────────────────────────────────────────────────────────────────────
+
+/** SMPL canonical 序中的关键关节索引 */
+const LEFT_HIP = 1;
+const RIGHT_HIP = 2;
+const LEFT_SHOULDER = 16;
+const RIGHT_SHOULDER = 17;
+
+/**
+ * 计算将 spine 对齐到 +Y 轴所需的四元数旋转 (w, x, y, z)。
+ *
+ * SMPL canonical 坐标中 spine 默认沿 +Y 轴（直立姿态），但横卧视频的
+ * spine 可能沿其他方向。此函数通过 hip→shoulder 向量计算最短弧旋转，
+ * 使 spine 重新对齐到 +Y 轴。
+ *
+ * 仅当 spine 与 +Y 轴夹角 > 45° 时返回非单位旋转，避免对已直立的视频
+ * 引入不必要的变换。
+ */
+function computeSpineQuaternion(joints: Float32Array): [number, number, number, number] {
+  // 计算 hip 中点
+  const hipX = (joints[LEFT_HIP * 3] + joints[RIGHT_HIP * 3]) / 2;
+  const hipY = (joints[LEFT_HIP * 3 + 1] + joints[RIGHT_HIP * 3 + 1]) / 2;
+  const hipZ = (joints[LEFT_HIP * 3 + 2] + joints[RIGHT_HIP * 3 + 2]) / 2;
+
+  // 计算 shoulder 中点
+  const shoulderX = (joints[LEFT_SHOULDER * 3] + joints[RIGHT_SHOULDER * 3]) / 2;
+  const shoulderY = (joints[LEFT_SHOULDER * 3 + 1] + joints[RIGHT_SHOULDER * 3 + 1]) / 2;
+  const shoulderZ = (joints[LEFT_SHOULDER * 3 + 2] + joints[RIGHT_SHOULDER * 3 + 2]) / 2;
+
+  // spine 向量：hip → shoulder
+  const spineX = shoulderX - hipX;
+  const spineY = shoulderY - hipY;
+  const spineZ = shoulderZ - hipZ;
+
+  const spineLen = Math.sqrt(spineX * spineX + spineY * spineY + spineZ * spineZ);
+  if (spineLen < 0.01) return [1, 0, 0, 0]; // 退化情况，返回单位四元数
+
+  // 归一化 spine 向量
+  const nx = spineX / spineLen;
+  const ny = spineY / spineLen;
+  const nz = spineZ / spineLen;
+
+  // 检查 spine 与 +Y 轴的夹角
+  // cos(angle) = spine · (0,1,0) = ny
+  const cosAngle = ny;
+
+  // 仅当夹角 > 45° (cos < cos(45°) ≈ 0.707) 时才应用旋转
+  if (cosAngle > 0.707) return [1, 0, 0, 0];
+
+  // 目标向量：+Y 轴 (0, 1, 0)
+  // 旋转轴 = spine × target = (nx, ny, nz) × (0, 1, 0)
+  const ax = ny * 0 - nz * 1; // -nz
+  const ay = nz * 0 - nx * 0; // 0
+  const az = nx * 1 - ny * 0; // nx
+
+  const axisLen = Math.sqrt(ax * ax + ay * ay + az * az);
+  if (axisLen < 0.01) {
+    // spine 与 Y 轴平行
+    if (ny > 0) return [1, 0, 0, 0]; // 同向，无需旋转
+    // 反向（spine 朝下），绕 X 轴旋转 180°
+    return [0, 1, 0, 0];
+  }
+
+  // 旋转角度
+  const clampedCos = Math.max(-1, Math.min(1, cosAngle));
+  const angle = Math.acos(clampedCos);
+  const halfAngle = angle / 2;
+  const sinHalf = Math.sin(halfAngle);
+
+  // 返回四元数 (w, x, y, z)
+  return [
+    Math.cos(halfAngle),
+    (ax / axisLen) * sinHalf,
+    (ay / axisLen) * sinHalf,
+    (az / axisLen) * sinHalf,
+  ];
+}
+
+/**
+ * 使用四元数旋转三维点。
+ * 公式：v' = q * v * q^-1，展开为高效计算形式。
+ */
+function applyQuaternionRotation(
+  x: number, y: number, z: number,
+  qw: number, qx: number, qy: number, qz: number,
+): [number, number, number] {
+  // 简化四元数旋转公式
+  const tx = 2 * (qy * z - qz * y);
+  const ty = 2 * (qz * x - qw * z);
+  const tz = 2 * (qw * y - qx * x);
+
+  return [
+    x + qw * tx + qy * tz - qz * ty,
+    y + qw * ty + qz * tx - qx * tz,
+    z + qw * tz + qx * ty - qy * tx,
+  ];
+}
+
+/**
+ * 对关节数组应用四元数旋转（原地修改）。
+ * joints 为扁平数组，每 3 个元素为一个点的 (x, y, z)。
+ */
+export function applyRotationToJoints(joints: Float32Array, q: [number, number, number, number]): void {
+  const [qw, qx, qy, qz] = q;
+  // 单位四元数无需旋转
+  if (qw === 1 && qx === 0 && qy === 0 && qz === 0) return;
+
+  for (let i = 0; i < joints.length / 3; i++) {
+    const [rx, ry, rz] = applyQuaternionRotation(
+      joints[i * 3], joints[i * 3 + 1], joints[i * 3 + 2],
+      qw, qx, qy, qz,
+    );
+    joints[i * 3] = rx;
+    joints[i * 3 + 1] = ry;
+    joints[i * 3 + 2] = rz;
+  }
+}
+
+/**
+ * 计算 keyframes 的 spine 朝向校正四元数。
+ * 供 viewer 组件在渲染时应用相同的旋转变换。
+ *
+ * 返回四元数 (w, x, y, z)，若 spine 已直立（与 +Y 轴夹角 ≤ 45°）则返回单位四元数。
+ */
+export function computeSpineOrientation(keyframes: Keyframe[]): [number, number, number, number] {
+  if (keyframes.length === 0) return [1, 0, 0, 0];
+
+  // 找到第一个有完整 joints_3d 的关键帧
+  const firstFrame = keyframes.find(
+    (kf) => kf.joints_3d && kf.joints_3d.length >= 24,
+  );
+  if (!firstFrame) return [1, 0, 0, 0];
+
+  const joints = new Float32Array(firstFrame.joints_3d.length * 3);
+  for (let i = 0; i < firstFrame.joints_3d.length; i++) {
+    joints[i * 3] = firstFrame.joints_3d[i][0];
+    joints[i * 3 + 1] = firstFrame.joints_3d[i][1];
+    joints[i * 3 + 2] = firstFrame.joints_3d[i][2];
+  }
+  return computeSpineQuaternion(joints);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // 关键帧插值
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -320,29 +464,55 @@ export function sampleMeshVertices(
 
 /**
  * 计算 mesh 顶点的居中/缩放变换（与 computeFraming 类似，但基于 mesh 顶点）。
+ * 包含 spine 朝向校正：若 spine 与 +Y 轴夹角 > 45°，先旋转使其直立。
  */
 export function computeMeshFraming(
   keyframes: Keyframe[],
   targetSize = 2.4,
 ): FrameTransform {
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-  let hasData = false;
+  // 收集所有 mesh 顶点并计算 spine 旋转
+  const allVertices: number[] = [];
+  let spineQuat: [number, number, number, number] | null = null;
 
   for (const kf of keyframes) {
     if (!kf.mesh_vertices) continue;
-    hasData = true;
     for (const [x, y, z] of kf.mesh_vertices) {
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-      if (z > maxZ) maxZ = z;
+      allVertices.push(x, y, z);
+    }
+    // 使用第一帧的关节数据计算 spine 旋转（只需计算一次）
+    if (spineQuat === null && kf.joints_3d && kf.joints_3d.length >= 24) {
+      const joints = new Float32Array(kf.joints_3d.length * 3);
+      for (let i = 0; i < kf.joints_3d.length; i++) {
+        joints[i * 3] = kf.joints_3d[i][0];
+        joints[i * 3 + 1] = kf.joints_3d[i][1];
+        joints[i * 3 + 2] = kf.joints_3d[i][2];
+      }
+      spineQuat = computeSpineQuaternion(joints);
     }
   }
 
-  if (!hasData) return { offset: [0, 0, 0], scale: 1 };
+  if (allVertices.length === 0) return { offset: [0, 0, 0], scale: 1 };
+
+  // 应用 spine 旋转（如果有）
+  const verticesFlat = new Float32Array(allVertices);
+  if (spineQuat) {
+    applyRotationToJoints(verticesFlat, spineQuat);
+  }
+
+  // 计算旋转后的包围盒
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < verticesFlat.length / 3; i++) {
+    const x = verticesFlat[i * 3];
+    const y = verticesFlat[i * 3 + 1];
+    const z = verticesFlat[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
 
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
@@ -362,6 +532,7 @@ export interface FrameTransform {
 /**
  * 计算把骨架居中并归一化到目标尺寸所需的偏移与缩放。
  * 基于所有关键帧的全局包围盒，保证整段动画使用同一变换，骨架不会漂移。
+ * 包含 spine 朝向校正：若 spine 与 +Y 轴夹角 > 45°，先旋转使其直立。
  */
 export function computeFraming(
   keyframes: Keyframe[],
@@ -371,18 +542,46 @@ export function computeFraming(
     return { offset: [0, 0, 0], scale: 1 };
   }
 
-  let minX = Infinity, minY = Infinity, minZ = Infinity;
-  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  // 收集所有关节坐标
+  const allJoints: number[] = [];
   for (const kf of keyframes) {
     for (const [x, y, z] of kf.joints_3d) {
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-      if (z > maxZ) maxZ = z;
+      allJoints.push(x, y, z);
     }
   }
+
+  // 计算 spine 旋转（使用第一帧）
+  const firstFrame = keyframes[0];
+  let spineQuat: [number, number, number, number] = [1, 0, 0, 0];
+  if (firstFrame && firstFrame.joints_3d && firstFrame.joints_3d.length >= 24) {
+    const joints = new Float32Array(firstFrame.joints_3d.length * 3);
+    for (let i = 0; i < firstFrame.joints_3d.length; i++) {
+      joints[i * 3] = firstFrame.joints_3d[i][0];
+      joints[i * 3 + 1] = firstFrame.joints_3d[i][1];
+      joints[i * 3 + 2] = firstFrame.joints_3d[i][2];
+    }
+    spineQuat = computeSpineQuaternion(joints);
+  }
+
+  // 应用 spine 旋转
+  const jointsFlat = new Float32Array(allJoints);
+  applyRotationToJoints(jointsFlat, spineQuat);
+
+  // 计算旋转后的包围盒
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < jointsFlat.length / 3; i++) {
+    const x = jointsFlat[i * 3];
+    const y = jointsFlat[i * 3 + 1];
+    const z = jointsFlat[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
   const cz = (minZ + maxZ) / 2;

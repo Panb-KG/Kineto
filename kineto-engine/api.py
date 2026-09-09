@@ -925,6 +925,12 @@ def get_demo_video(job_id: str) -> FileResponse:
     return _serve_artifact(job_id, "demo_output.mp4")
 
 
+@app.get("/jobs/{job_id}/annotated_output.mp4", dependencies=[Depends(require_api_key)])
+def get_annotated_video(job_id: str) -> FileResponse:
+    """获取骨骼标注视频"""
+    return _serve_artifact(job_id, "annotated_output.mp4")
+
+
 @app.get("/jobs/{job_id}/input.mp4", dependencies=[Depends(require_api_key)])
 def get_input_video(job_id: str) -> FileResponse:
     """返回原始上传视频"""

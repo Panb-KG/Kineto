@@ -26,7 +26,9 @@ import type { PoseTimeline } from "../lib/timeline";
 import {
   buildTimeIndex,
   computeFraming,
+  computeSpineOrientation,
   sampleJoints,
+  applyRotationToJoints,
 } from "../lib/timeline";
 import {
   SMPL_JOINT_NAMES,
@@ -63,6 +65,11 @@ function SkeletonRig({
     () => computeFraming(keyframes, targetSize),
     [keyframes, targetSize],
   );
+  // Spine 朝向校正四元数（横卧视频 → 直立）
+  const spineQuat = useMemo(
+    () => computeSpineOrientation(keyframes),
+    [keyframes],
+  );
 
   // 复用的采样缓冲与临时向量，避免每帧 GC
   const buffer = useRef<Float32Array>(new Float32Array(JOINT_COUNT * 3));
@@ -80,6 +87,8 @@ function SkeletonRig({
   useFrame(() => {
     const ms = timeline.getMs();
     sampleJoints(timeIndex, ms, buffer.current);
+    // 应用 spine 朝向校正（横卧视频 → 直立）
+    applyRotationToJoints(buffer.current, spineQuat);
     const buf = buffer.current;
 
     // 更新关节球位置（直接应用 offset + scale，无旋转）
