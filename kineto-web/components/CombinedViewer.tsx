@@ -30,7 +30,7 @@ import {
   SMPL_SKELETON,
   boneColor,
 } from "../lib/skeleton";
-import type { Keyframe, Vec3 } from "../lib/types";
+import type { Keyframe, MeshTrack, Vec3 } from "../lib/types";
 import { MESH_VERTEX_COUNT, JOINT_COUNT } from "../lib/types";
 
 // ── 视觉常量（与 MeshViewer / SkeletonViewer 保持一致）────────────────────
@@ -45,6 +45,11 @@ interface CombinedViewerProps {
   keyframes: Keyframe[];
   faces: Vec3[];
   timeline: PoseTimeline;
+  /**
+   * [P1 mesh 节奏贴合] 全帧顶点二进制轨道（API 产物携带）。
+   * 缺省/帧数不符时自动回退旧 JSON 嵌入采样（fixture 兼容）。
+   */
+  meshTrack?: MeshTrack;
   showWireframe?: boolean;
   targetSize?: number;
 }
@@ -54,6 +59,7 @@ function SMPLMesh({
   keyframes,
   faces,
   timeline,
+  meshTrack,
   showWireframe = false,
   offset,
   scale,
@@ -62,11 +68,16 @@ function SMPLMesh({
   keyframes: Keyframe[];
   faces: Vec3[];
   timeline: PoseTimeline;
+  meshTrack?: MeshTrack;
   showWireframe: boolean;
   offset: [number, number, number];
   scale: number;
   timeIndex: ReturnType<typeof buildTimeIndex>;
 }) {
+  // 轨道帧数与 keyframes 一致才视为有效（不一致回退嵌入路径）
+  const track =
+    meshTrack && meshTrack.frameCount === keyframes.length ? meshTrack : undefined;
+
   const vertexBuffer = useRef<Float32Array>(
     new Float32Array(MESH_VERTEX_COUNT * 3),
   );
@@ -75,13 +86,23 @@ function SMPLMesh({
     const geo = new THREE.BufferGeometry();
 
     const positions = new Float32Array(MESH_VERTEX_COUNT * 3);
-    const firstFrame = keyframes.find((kf) => kf.mesh_vertices);
-    if (firstFrame?.mesh_vertices) {
-      const verts = firstFrame.mesh_vertices;
-      for (let k = 0; k < verts.length; k++) {
-        positions[k * 3] = (verts[k][0] + offset[0]) * scale;
-        positions[k * 3 + 1] = (verts[k][1] + offset[1]) * scale;
-        positions[k * 3 + 2] = (verts[k][2] + offset[2]) * scale;
+    if (track) {
+      // [P1] 二进制轨道第 0 帧（已预翻转世界系）
+      const v = track.vertices;
+      for (let k = 0; k < MESH_VERTEX_COUNT; k++) {
+        positions[k * 3] = (v[k * 3] + offset[0]) * scale;
+        positions[k * 3 + 1] = (v[k * 3 + 1] + offset[1]) * scale;
+        positions[k * 3 + 2] = (v[k * 3 + 2] + offset[2]) * scale;
+      }
+    } else {
+      const firstFrame = keyframes.find((kf) => kf.mesh_vertices);
+      if (firstFrame?.mesh_vertices) {
+        const verts = firstFrame.mesh_vertices;
+        for (let k = 0; k < verts.length; k++) {
+          positions[k * 3] = (verts[k][0] + offset[0]) * scale;
+          positions[k * 3 + 1] = (verts[k][1] + offset[1]) * scale;
+          positions[k * 3 + 2] = (verts[k][2] + offset[2]) * scale;
+        }
       }
     }
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -96,11 +117,11 @@ function SMPLMesh({
     geo.computeVertexNormals();
 
     return geo;
-  }, [keyframes, faces, offset, scale]);
+  }, [keyframes, faces, track, offset, scale]);
 
   useFrame(() => {
     const ms = timeline.getMs();
-    sampleMeshVertices(timeIndex, ms, vertexBuffer.current);
+    sampleMeshVertices(timeIndex, ms, vertexBuffer.current, track);
 
     const posAttr = geometry.attributes.position as THREE.BufferAttribute;
     const arr = posAttr.array as Float32Array;
@@ -283,13 +304,14 @@ export default function CombinedViewer({
   keyframes,
   faces,
   timeline,
+  meshTrack,
   showWireframe = false,
   targetSize = 2.4,
 }: CombinedViewerProps) {
   // 统一 framing：基于 mesh bounding box，同时应用于 mesh 和 skeleton
   const framing = useMemo(
-    () => computeMeshFraming(keyframes, targetSize),
-    [keyframes, targetSize],
+    () => computeMeshFraming(keyframes, targetSize, meshTrack),
+    [keyframes, meshTrack, targetSize],
   );
   const timeIndex = useMemo(() => buildTimeIndex(keyframes), [keyframes]);
   const { offset, scale } = framing;
@@ -307,6 +329,7 @@ export default function CombinedViewer({
         keyframes={keyframes}
         faces={faces}
         timeline={timeline}
+        meshTrack={meshTrack}
         showWireframe={showWireframe}
         offset={offset}
         scale={scale}

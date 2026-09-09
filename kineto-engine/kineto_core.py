@@ -395,10 +395,13 @@ class PoseExtractor:
             return {"has_mesh": False, "mesh_vertices": [], "faces": []}
 
         try:
-            all_vertices = []
+            # [P1 mesh 节奏贴合] 预分配 (帧数, 6890, 3) float32 缓冲：全帧 mesh
+            # 下顶点直接写 ndarray，避免 Python 嵌套 list 的数 GB 峰值内存。
+            all_vertices = np.empty(
+                (len(keyframes), 6890, 3), dtype=np.float32)
             faces = self.model.smpl.faces  # numpy array, shared across frames
 
-            for kf in keyframes:  # 调用方已做均匀采样，此处不再硬编码截断
+            for fi, kf in enumerate(keyframes):
                 betas = kf.get("betas", [0] * 10)
                 smpl_thetas = kf.get("smpl_thetas", [0] * 72)
 
@@ -437,11 +440,11 @@ class PoseExtractor:
                     t_align = np.asarray(joints_ref[0], dtype=np.float32) - fk_joints[0]
                     vertices = vertices + t_align[np.newaxis, :]
 
-                all_vertices.append(vertices.tolist())
+                all_vertices[fi] = vertices
 
             return {
                 "has_mesh": True,
-                "mesh_vertices": all_vertices,  # 4 × 6890 × 3
+                "mesh_vertices": all_vertices,  # (帧数, 6890, 3) float32，全帧
                 "faces": faces.tolist(),  # 13776 × 3
                 "mesh_vertices_per_frame": 6890,
             }
@@ -1859,30 +1862,24 @@ def _process_video_impl(stack, input_path, output_dir, device,
     else:
         pose_info = {"pose_type": "unknown", "spine_direction": [0, 0, 0], "confidence": 0.0}
 
-    # ---- SMPL Mesh 计算（均匀采样关键帧，覆盖整段动画）----
-    # [Fix #61] 旧实现只取 keyframes[:4]（前 4 帧），导致 mesh 仅在动画开头
-    # 极短时间段有数据，其余时间静止不动。改为从全部帧中均匀采样，使 mesh
-    # 动画覆盖整段视频。上限 16 帧（SMPL forward 每帧 ~50-100ms，16 帧 <2s）。
-    MESH_FRAME_BUDGET = 16
-    n_total_kf = len(keyframes)
-    if n_total_kf > MESH_FRAME_BUDGET:
-        _mesh_sample = np.linspace(0, n_total_kf - 1, MESH_FRAME_BUDGET, dtype=int).tolist()
-        mesh_keyframes = [keyframes[i] for i in _mesh_sample]
-    else:
-        mesh_keyframes = keyframes
-    mesh_result = extractor.compute_mesh_for_keyframes(mesh_keyframes)
+    # ---- SMPL Mesh 计算（全帧，顶点写独立二进制）----
+    # [P1 mesh 节奏贴合] 旧实现 MESH_FRAME_BUDGET=16 均匀采样嵌入 JSON：叠加
+    # 模式下 mesh 每 ~1.7s 才动一次，与骨架全帧 60fps 插值节奏必然脱节；且
+    # 全帧嵌入 JSON 约 150MB 不可行。改为**全帧** SMPL forward（J_regressor
+    # 线性性保证：顶点相邻帧线性插值与 joints_3d 线性插值严格同步，叠加模式
+    # 位置/节奏完全贴合），顶点写独立二进制 mesh_vertices.f32
+    # （帧数×6890×3 float32 LE，466 帧约 38.5MB），JSON 不再嵌入顶点。
+    mesh_bin_name = "mesh_vertices.f32"
+    mesh_result = extractor.compute_mesh_for_keyframes(keyframes)
+    mesh_frames = 0
+    mesh_vertex_count = 0
     if mesh_result["has_mesh"]:
-        print(f"[Mesh] ✓ 计算完成：{len(mesh_result['mesh_vertices'])} 帧 × "
-              f"{mesh_result['mesh_vertices_per_frame']} 顶点, "
-              f"{len(mesh_result['faces'])} 面")
-        # 将 mesh_vertices 写入对应的关键帧（按采样索引映射回去）
-        if n_total_kf > MESH_FRAME_BUDGET:
-            for sample_i, mesh_verts in zip(_mesh_sample, mesh_result["mesh_vertices"]):
-                keyframes[sample_i]["mesh_vertices"] = mesh_verts
-        else:
-            for idx_kf, kf in enumerate(keyframes):
-                kf["mesh_vertices"] = (mesh_result["mesh_vertices"][idx_kf]
-                                       if idx_kf < len(mesh_result["mesh_vertices"]) else [])
+        verts_arr = np.asarray(mesh_result["mesh_vertices"], dtype=np.float32)
+        mesh_frames, mesh_vertex_count = int(verts_arr.shape[0]), int(verts_arr.shape[1])
+        verts_arr.tofile(output_path / mesh_bin_name)
+        print(f"[Mesh] ✓ 计算完成：{mesh_frames} 帧 × {mesh_vertex_count} 顶点, "
+              f"{len(mesh_result['faces'])} 面 → {mesh_bin_name}"
+              f"（{verts_arr.nbytes / 1e6:.1f}MB）")
     else:
         print("[Mesh] 无 mesh（fallback 模式或计算失败）")
 
@@ -1907,9 +1904,11 @@ def _process_video_impl(stack, input_path, output_dir, device,
         # 四宫格教学图
         "grid_images": grid_result["grid_images"],
         "grid_labels": grid_result["grid_labels"],
-        # SMPL mesh
+        # SMPL mesh（[P1] 顶点在独立二进制 mesh_vertices.f32，与 keyframes 1:1）
         "has_mesh": mesh_result["has_mesh"],
-        "mesh_vertices_per_frame": mesh_result.get("mesh_vertices_per_frame", 0),
+        "mesh_vertices_per_frame": mesh_vertex_count,
+        "mesh_vertices_frames": mesh_frames,
+        "mesh_vertices_file": mesh_bin_name if mesh_frames > 0 else None,
         "pipeline": {
             "max_iterations": max_iterations,
             "quality_threshold": quality_threshold,

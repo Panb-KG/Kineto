@@ -180,7 +180,7 @@ function ReadyStage({
   degraded?: boolean;
   jobId?: string;
 }) {
-  const { data, source, fallbackReason } = loaded;
+  const { data, source, fallbackReason, meshTrack } = loaded;
   const keyframes = useMemo(() => data.keyframes, [data]);
   const { timeline, playing, durationMs, toggle } = useTimeline(keyframes, true);
 
@@ -188,10 +188,14 @@ function ReadyStage({
   const videoSync = useVideoSync();
 
   // 检查是否有 mesh 数据
-  const hasMesh = data.metadata.has_mesh === true && 
-    data.mesh_faces !== undefined && 
+  // [P1 mesh 节奏贴合] 二进制轨道（API 产物）或旧 JSON 嵌入顶点（fixture）
+  // 任一存在即可；faces 仍从 pose_data.json 根级读取（两种格式一致）。
+  const hasMesh =
+    data.metadata.has_mesh === true &&
+    data.mesh_faces !== undefined &&
     data.mesh_faces.length > 0 &&
-    keyframes.some((kf) => kf.mesh_vertices && kf.mesh_vertices.length > 0);
+    (meshTrack !== undefined ||
+      keyframes.some((kf) => kf.mesh_vertices && kf.mesh_vertices.length > 0));
 
   // 视图模式切换（默认骨架，有 mesh 数据时可选）
   const [viewMode, setViewMode] = useState<ViewMode>("skeleton");
@@ -289,6 +293,7 @@ function ReadyStage({
               keyframes={keyframes}
               faces={data.mesh_faces!}
               timeline={timeline}
+              meshTrack={meshTrack}
               showWireframe={showWireframe}
             />
           )}
@@ -297,6 +302,7 @@ function ReadyStage({
               keyframes={keyframes}
               faces={data.mesh_faces!}
               timeline={timeline}
+              meshTrack={meshTrack}
               showWireframe={showWireframe}
             />
           )}

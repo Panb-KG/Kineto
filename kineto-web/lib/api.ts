@@ -133,6 +133,42 @@ export async function fetchPoseData(
   return (await res.json()) as PoseData;
 }
 
+/**
+ * [P1 mesh 节奏贴合] 拉取 SMPL 顶点二进制（mesh_vertices.f32）。
+ *
+ * 布局：帧数×vertexCount×3 float32 LE（相机系坐标），与 keyframes 1:1。
+ * 字节数不符时抛错（契约被破坏不应静默渲染错数据）。
+ */
+export async function fetchMeshVerticesRaw(
+  jobId: string,
+  frameCount: number,
+  vertexCount: number,
+  signal?: AbortSignal,
+): Promise<Float32Array> {
+  const url = `${API_BASE}/jobs/${encodeURIComponent(jobId)}/mesh_vertices.f32`;
+  let res: Response;
+  try {
+    res = await fetch(url, { signal, cache: "no-store" });
+  } catch (err) {
+    throw new ApiError(`无法连接后端: ${url}`, undefined, err);
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      await reasonFromResponse(res, `获取 mesh_vertices.f32 失败 (${res.status})`),
+      res.status,
+    );
+  }
+  const buf = await res.arrayBuffer();
+  const expected = frameCount * vertexCount * 3 * 4;
+  if (buf.byteLength !== expected) {
+    throw new ApiError(
+      `mesh_vertices.f32 大小不符：${buf.byteLength}B ≠ 预期 ${expected}B` +
+        `（${frameCount}×${vertexCount}×3×float32）`,
+    );
+  }
+  return new Float32Array(buf);
+}
+
 /** 轮询单个任务状态。 */
 export async function getJob(
   jobId: string,

@@ -18,7 +18,7 @@
  */
 
 import { Easing, Group, Tween } from "@tweenjs/tween.js";
-import type { Keyframe, Vec3 } from "./types";
+import type { Keyframe, MeshTrack, Vec3 } from "./types";
 
 /** 时间轴订阅者：接收当前播放时间（ms）。 */
 export type TimelineListener = (ms: number) => void;
@@ -254,15 +254,48 @@ export function sampleJoints(
  * 在给定时间采样 mesh 顶点坐标，写入 out（长度需为 vertexCount×3）。
  * 对相邻两个关键帧做线性插值；时间越界时 clamp 到首/尾帧。
  * 若某帧缺少 mesh_vertices，则回退到最近有数据的关键帧。
+ *
+ * [P1 mesh 节奏贴合] 传入 meshTrack（全帧二进制轨道，与 keyframes 严格 1:1、
+ * 已预翻转）时走直取路径：时间→帧下标二分后直接线性插值，不再扫描嵌入数据，
+ * 节奏与 sampleJoints 严格同步（同一 times 数组、同一 frac）。
  */
 export function sampleMeshVertices(
   index: TimeIndex,
   timeMs: number,
   out: Float32Array,
+  meshTrack?: MeshTrack,
 ): Float32Array {
   const { times, keyframes } = index;
   const n = keyframes.length;
   if (n === 0) return out;
+
+  // ── [P1] 全帧二进制轨道直取路径（顶点已预翻转，无需再变换）──
+  if (meshTrack && meshTrack.frameCount === n) {
+    const { vertices, vertexCount } = meshTrack;
+    const i = lowerIndex(times, timeMs);
+    const i2 = Math.min(i + 1, n - 1);
+    const t0 = times[i];
+    const t1 = times[i2];
+    const span = t1 - t0;
+    const frac = span > 1e-6 ? (timeMs - t0) / span : 0;
+
+    const count = Math.min(vertexCount, out.length / 3);
+    const baseA = i * vertexCount * 3;
+    const baseB = i2 * vertexCount * 3;
+    for (let k = 0; k < count; k++) {
+      const a3 = baseA + k * 3;
+      const b3 = baseB + k * 3;
+      const ax = vertices[a3];
+      const ay = vertices[a3 + 1];
+      const az = vertices[a3 + 2];
+      out[k * 3] = ax + (vertices[b3] - ax) * frac;
+      out[k * 3 + 1] = ay + (vertices[b3 + 1] - ay) * frac;
+      out[k * 3 + 2] = az + (vertices[b3 + 2] - az) * frac;
+    }
+    return out;
+  }
+
+  // ── 旧 JSON 嵌入路径（fixture / 旧 16 帧产物兼容）──
 
   // 找到最近有 mesh_vertices 的帧
   const findMeshFrame = (startIdx: number, direction: 1 | -1): number => {
@@ -320,11 +353,19 @@ export function sampleMeshVertices(
 
 /**
  * 计算 mesh 顶点的居中/缩放变换（与 computeFraming 类似，但基于 mesh 顶点）。
+ * [P1] 传入 meshTrack 时直接在预翻转二进制上扫全帧包围盒（一次 O(帧数×6890)，
+ * 播放期零开销），语义与旧路径一致（全帧并集，动画不漂移）。
  */
 export function computeMeshFraming(
   keyframes: Keyframe[],
   targetSize = 2.4,
+  meshTrack?: MeshTrack,
 ): FrameTransform {
+  // ── [P1] 全帧二进制轨道路径 ──
+  if (meshTrack && meshTrack.frameCount === keyframes.length) {
+    return framingFromFlatArray(meshTrack.vertices, targetSize);
+  }
+
   // 收集所有 mesh 顶点（相机坐标→世界坐标：Y 翻转，Z 翻转）
   const allVertices: number[] = [];
   for (const kf of keyframes) {
@@ -352,12 +393,41 @@ export function computeMeshFraming(
     if (z > maxZ) maxZ = z;
   }
 
+  return bboxToTransform(minX, minY, minZ, maxX, maxY, maxZ, targetSize);
+}
+
+/** 由扁平 [x,y,z] 数组（已世界系）求包围盒并输出居中/缩放变换。 */
+function framingFromFlatArray(
+  flat: Float32Array,
+  targetSize: number,
+): FrameTransform {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  for (let i = 0; i < flat.length / 3; i++) {
+    const x = flat[i * 3];
+    const y = flat[i * 3 + 1];
+    const z = flat[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+  return bboxToTransform(minX, minY, minZ, maxX, maxY, maxZ, targetSize);
+}
+
+/** 包围盒 → 居中 offset + 归一化 scale（共同收尾）。 */
+function bboxToTransform(
+  minX: number, minY: number, minZ: number,
+  maxX: number, maxY: number, maxZ: number,
+  targetSize: number,
+): FrameTransform {
   const cx = (minX + maxX) / 2;
   const cy = (minY + maxY) / 2;
   const cz = (minZ + maxZ) / 2;
   const span = Math.max(maxX - minX, maxY - minY, maxZ - minZ, 1e-6);
   const scale = targetSize / span;
-
   return { offset: [-cx, -cy, -cz], scale };
 }
 

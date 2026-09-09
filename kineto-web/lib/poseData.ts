@@ -11,9 +11,14 @@
  * 加载结果附带 source 标记（'api' | 'fixture'）与可选告警信息，供 UI 展示。
  */
 
-import { ApiError, fetchPoseData, isApiConfigured } from "./api";
-import type { PoseData } from "./types";
-import { JOINT_COUNT, JOINT_ORDER_CANONICAL } from "./types";
+import {
+  ApiError,
+  fetchMeshVerticesRaw,
+  fetchPoseData,
+  isApiConfigured,
+} from "./api";
+import type { MeshTrack, PoseData } from "./types";
+import { JOINT_COUNT, JOINT_ORDER_CANONICAL, MESH_VERTEX_COUNT } from "./types";
 
 /**
  * 内置示例数据（复制自关节序根因整改后的 canonical 产物
@@ -29,6 +34,69 @@ export interface LoadedPoseData {
   source: PoseDataSource;
   /** 若从 API 回退到 fixture，此处记录回退原因，供 UI 提示。 */
   fallbackReason?: string;
+  /**
+   * [P1 mesh 节奏贴合] SMPL 顶点二进制轨道（仅 API 产物携带；
+   * fixture / 旧 16 帧嵌入格式产物无此字段，叠加模式回退旧采样路径）。
+   */
+  meshTrack?: MeshTrack;
+}
+
+/**
+ * [P1] 组装 mesh 二进制轨道：相机系→世界系预翻转（y→-y, z→-z，与
+ * sampleJoints 同一变换），帧数必须与 keyframes 1:1（节奏映射契约）。
+ */
+function buildMeshTrack(raw: Float32Array, keyframeCount: number): MeshTrack {
+  const frameCount = raw.length / (MESH_VERTEX_COUNT * 3);
+  if (!Number.isInteger(frameCount) || frameCount !== keyframeCount) {
+    throw new Error(
+      `mesh_vertices.f32 帧数不符：${frameCount} ≠ keyframes ${keyframeCount}`,
+    );
+  }
+  // 预翻转：一次 O(n) 拷贝，采样期零额外变换
+  for (let i = 0; i < frameCount; i++) {
+    const base = i * MESH_VERTEX_COUNT * 3;
+    for (let k = 0; k < MESH_VERTEX_COUNT; k++) {
+      raw[base + k * 3 + 1] = -raw[base + k * 3 + 1]; // Y 翻转
+      raw[base + k * 3 + 2] = -raw[base + k * 3 + 2]; // Z 翻转
+    }
+  }
+  return { frameCount, vertexCount: MESH_VERTEX_COUNT, vertices: raw };
+}
+
+/** 从 API 拉取 mesh 二进制并组装 MeshTrack；失败返回 undefined（不阻塞骨架）。 */
+async function loadMeshTrack(
+  jobId: string,
+  data: PoseData,
+  signal?: AbortSignal,
+): Promise<MeshTrack | undefined> {
+  const { mesh_vertices_file, mesh_vertices_frames, mesh_vertices_per_frame } =
+    data.metadata;
+  if (!mesh_vertices_file || !mesh_vertices_frames || !mesh_vertices_per_frame) {
+    return undefined;
+  }
+  if (mesh_vertices_per_frame !== MESH_VERTEX_COUNT) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[kineto] mesh_vertices_per_frame=${mesh_vertices_per_frame} 非 SMPL 标准 ` +
+        `${MESH_VERTEX_COUNT}，忽略二进制轨道（叠加模式回退旧路径）`,
+    );
+    return undefined;
+  }
+  try {
+    const raw = await fetchMeshVerticesRaw(
+      jobId,
+      mesh_vertices_frames,
+      mesh_vertices_per_frame,
+      signal,
+    );
+    return buildMeshTrack(raw, data.keyframes.length);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[kineto] mesh 二进制加载失败（叠加模式回退旧路径）: ${String(err)}`,
+    );
+    return undefined;
+  }
 }
 
 /** 从静态 fixture 加载（离线默认路径）。 */
@@ -54,7 +122,10 @@ export async function loadPoseData(
     try {
       const data = await fetchPoseData(jobId, signal);
       validatePoseData(data);
-      return { data, source: "api" };
+      // [P1] mesh 二进制轨道：失败不阻塞骨架展示（meshTrack 为 undefined 时
+      // 渲染层自动回退旧 JSON 嵌入路径）。
+      const meshTrack = await loadMeshTrack(jobId, data, signal);
+      return { data, source: "api", meshTrack };
     } catch (err) {
       const reason =
         err instanceof ApiError ? err.message : `API 加载失败: ${String(err)}`;

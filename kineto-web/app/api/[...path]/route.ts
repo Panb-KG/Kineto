@@ -15,7 +15,8 @@
  *
  * 转发要点：
  *   - MJ3(b) 方法+路径白名单：仅放行 POST /jobs、GET /jobs/{id}、
- *     GET /jobs/{id}/pose_data.json、GET /jobs/{id}/demo_output.mp4、
+ *     GET /jobs/{id}/pose_data.json、GET /jobs/{id}/mesh_vertices.f32、
+ *     GET /jobs/{id}/demo_output.mp4、
  *     GET /jobs/{id}/input.mp4、GET /jobs/{id}/annotated_output.mp4、GET /health、GET /healthz；其余一律 404（防止代理沦为任意 URL 中继）；
  *   - MJ3(a) per-IP 令牌桶限流：POST /jobs 每 IP 每 10min 最多 3 次，超限 429 +
  *     Retry-After（内存态，单实例级；多实例部署下为已接受残留风险）；
@@ -66,9 +67,9 @@ function isAllowedRoute(method: string, path: string[]): boolean {
     if (
       p.length === 3 &&
       p[0] === "jobs" &&
-      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4" || p[2] === "annotated_output.mp4" || /^grid_\d{2}\.jpg$/.test(p[2]))
+      (p[2] === "pose_data.json" || p[2] === "demo_output.mp4" || p[2] === "input.mp4" || p[2] === "annotated_output.mp4" || p[2] === "mesh_vertices.f32" || /^grid_\d{2}\.jpg$/.test(p[2]))
     ) {
-      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4|annotated_output.mp4|grid_XX.jpg}
+      return true; // /jobs/{id}/{pose_data.json|demo_output.mp4|input.mp4|annotated_output.mp4|mesh_vertices.f32|grid_XX.jpg}
     }
   }
   return false;

@@ -627,10 +627,15 @@ def _find_pose_data_with_mesh(engine_dir: Path) -> Path | None:
 def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, rep: Report) -> None:
     """G14：对产物 pose_data.json 断言 mesh 顶点与 joints_3d 同坐标（叠加模式贴合性）。
 
-    方法：对每个携带 mesh_vertices 的关键帧，用 SSOT 的 SMPL_J_REGRESSOR 从顶点
-    回归 24 关节，与交付 joints_3d 逐关节比较。引擎 [P0 mesh↔joints 对齐] 保证
-    两者按构造重合（残差 ≈0），故超阈值即判产物漂移（旧管线生成）。
-    无产物 / 无 mesh 帧 / J_regressor 不可用时 SKIP（不影响退出码）。
+    方法：用 SSOT 的 SMPL_J_REGRESSOR 从顶点回归 24 关节，与交付 joints_3d
+    逐关节比较。引擎 [P0 mesh↔joints 对齐] 保证两者按构造重合（残差 ≈0），
+    故超阈值即判产物漂移（旧管线生成）。
+
+    两条数据路径：
+      - [P1] 二进制优先：metadata.mesh_vertices_file（mesh_vertices.f32，
+        帧数×6890×3 float32 LE，与 keyframes 1:1）→ **全帧**断言（einsum）；
+      - 兼容旧产物：keyframes 内嵌 mesh_vertices（16 帧采样期格式）逐帧断言。
+    无产物 / 无 mesh / J_regressor 不可用时 SKIP（不影响退出码）。
     """
     if pose_data_path is None:
         rep.warn("G14 未找到产物 pose_data.json（output_test/output_closed/output 均缺失）→ SKIP")
@@ -661,6 +666,50 @@ def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, r
         rep.error(f"G14 产物读取失败: {pose_data_path} ({exc})")
         return
 
+    j_reg = np.asarray(j_regressor, dtype=np.float64).reshape(NUM_JOINTS, -1)
+
+    # ---- [P1] 二进制路径（全帧断言）----
+    meta = data.get("metadata", {})
+    bin_rel = meta.get("mesh_vertices_file")
+    frames_n = int(meta.get("mesh_vertices_frames") or 0)
+    vertex_count = int(meta.get("mesh_vertices_per_frame") or 0)
+    if bin_rel and frames_n > 0 and vertex_count > 0:
+        bin_path = pose_data_path.parent / bin_rel
+        if not bin_path.exists():
+            rep.error(f"G14 metadata 声明 {bin_rel} 但文件缺失（产物不完整）")
+            return
+        expected = frames_n * vertex_count * 3 * 4
+        raw = bin_path.read_bytes()
+        if len(raw) != expected:
+            rep.error(f"G14 {bin_rel} 大小 {len(raw)}B ≠ 预期 {expected}B"
+                      f"（{frames_n}×{vertex_count}×3×float32）")
+            return
+        keyframes = data.get("keyframes", [])
+        if len(keyframes) != frames_n:
+            rep.error(f"G14 二进制帧数 {frames_n} 与 keyframes 数 {len(keyframes)} 不一致"
+                      f"（1:1 契约被破坏，前端节奏映射将错位）")
+            return
+        verts_all = np.frombuffer(raw, dtype="<f4").reshape(frames_n, vertex_count, 3)
+        if verts_all.shape[1] != j_reg.shape[1]:
+            rep.error(f"G14 顶点数 {vertex_count} 与 J_regressor 列数 {j_reg.shape[1]} 不一致")
+            return
+        refs = np.asarray([k["joints_3d"] for k in keyframes], dtype=np.float64)
+        fk = np.einsum("jv,fvc->fjc", j_reg, verts_all.astype(np.float64))
+        err_mm = np.linalg.norm(fk - refs, axis=2) * 1000.0    # (F, 24)
+        max_err = float(err_mm.max())
+        mean_err = float(err_mm.mean())
+        worst_flat = int(err_mm.argmax())
+        worst_frame = int(keyframes[worst_flat // NUM_JOINTS].get("frame_index", -1))
+        if max_err <= _MESH_JOINTS_TOL_MM:
+            rep.ok(f"G14 mesh↔joints 一致（[P1] 二进制全帧）：{frames_n} 帧全部在容差内"
+                   f"（mean {mean_err:.2f}mm / max {max_err:.2f}mm ≤ {_MESH_JOINTS_TOL_MM}mm）")
+        else:
+            rep.drift(f"G14 mesh↔joints 错位：max {max_err:.2f}mm（帧 {worst_frame}）"
+                      f"> 容差 {_MESH_JOINTS_TOL_MM}mm —— 产物由未对齐的旧管线生成，"
+                      f"叠加模式骨架与 mesh 将偏离 ~{max_err:.0f}mm，须重跑管线重新生成产物")
+        return
+
+    # ---- 旧产物兼容路径（JSON 内嵌 mesh_vertices，16 帧采样期格式）----
     kfs = [k for k in data.get("keyframes", [])
            if k.get("mesh_vertices") and len(k.get("joints_3d", [])) == NUM_JOINTS]
     if not kfs:
@@ -668,7 +717,6 @@ def check_mesh_joints_alignment(pose_data_path: Path | None, engine_dir: Path, r
                  f"（叠加模式贴合性未被本次校验覆盖；真机重生成产物后复验）")
         return
 
-    j_reg = np.asarray(j_regressor, dtype=np.float64).reshape(NUM_JOINTS, -1)
     max_err, mean_err, worst_frame = 0.0, 0.0, -1
     checked = 0
     for kf in kfs:

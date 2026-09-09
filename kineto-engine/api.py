@@ -920,6 +920,16 @@ def get_pose_data(job_id: str) -> FileResponse:
     return _serve_artifact(job_id, "pose_data.json")
 
 
+@app.get("/jobs/{job_id}/mesh_vertices.f32", dependencies=[Depends(require_api_key)])
+def get_mesh_vertices(job_id: str) -> FileResponse:
+    """SMPL 顶点二进制（[P1 mesh 节奏贴合]：帧数×6890×3 float32 LE，与 keyframes 1:1）。
+
+    帧数/顶点数以 pose_data.json metadata 的 mesh_vertices_frames /
+    mesh_vertices_per_frame 为准。
+    """
+    return _serve_artifact(job_id, "mesh_vertices.f32")
+
+
 @app.get("/jobs/{job_id}/demo_output.mp4", dependencies=[Depends(require_api_key)])
 def get_demo_video(job_id: str) -> FileResponse:
     return _serve_artifact(job_id, "demo_output.mp4")

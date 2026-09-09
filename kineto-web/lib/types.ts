@@ -77,6 +77,16 @@ export interface PoseMetadata {
   grid_labels?: string[];
   /** 是否携带 SMPL mesh 数据（additive，旧产物可能缺失）。 */
   has_mesh?: boolean;
+  /**
+   * [P1 mesh 节奏贴合] SMPL 顶点二进制文件名（additive，旧产物缺失）。
+   * 值为 "mesh_vertices.f32"（位于产物目录内，经 /api 代理拉取）；
+   * 为 null/缺失时表示顶点走旧 JSON 嵌入格式（keyframes[].mesh_vertices）。
+   */
+  mesh_vertices_file?: string;
+  /** [P1] 二进制顶点轨道帧数（= keyframes.length，严格 1:1）。 */
+  mesh_vertices_frames?: number;
+  /** [P1] 每帧顶点数（SMPL 标准 6890）。 */
+  mesh_vertices_per_frame?: number;
 }
 
 /**
@@ -137,6 +147,24 @@ export const JOINT_ORDER_CANONICAL = "smpl-canonical";
 
 /** 任务状态枚举（后端契约：GET /jobs/{id} 的 state 字段）。 */
 export type JobState = "queued" | "running" | "done" | "failed";
+
+/**
+ * [P1 mesh 节奏贴合] SMPL 顶点二进制轨道。
+ *
+ * 由 mesh_vertices.f32 加载而来（帧数×vertexCount×3 float32 LE），与
+ * keyframes **严格 1:1**（第 i 帧顶点对应 keyframes[i]），加载时已做
+ * 相机系→世界系预翻转（y→-y, z→-z）。采样时对相邻帧线性插值——
+ * J_regressor 为线性映射，顶点插值与 joints_3d 插值严格同步，
+ * 叠加模式下骨架与 mesh 位置/节奏完全贴合。
+ */
+export interface MeshTrack {
+  /** 帧数（= keyframes.length）。 */
+  frameCount: number;
+  /** 每帧顶点数（SMPL 标准 6890）。 */
+  vertexCount: number;
+  /** 预翻转后的顶点数据，长度 frameCount × vertexCount × 3。 */
+  vertices: Float32Array;
+}
 
 /**
  * 后端任务对象（GET /jobs/{id} 返回体）。
