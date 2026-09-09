@@ -150,7 +150,7 @@
 
 ## 5. 待办 / 后续方向
 
-- **Zeabur 前端生产部署**：前端域名已定案 `https://kineto.标智云.中国`（punycode `kineto.xn--9kqt69c97a.xn--fiqs8s`）。设备侧 `KINETO_CORS_ORIGINS` 已更新为 punycode+UTF-8 双值（2026-09-09）。剩余待办全在 Zeabur 控制台：绑定自定义域名（自动 TLS）+ 阿里云子域 CNAME 到 Zeabur 目标 + 环境变量 `ENGINE_API_BASE=https://aibox.tail6791a3.ts.net` + `KINETO_API_KEY=<key>`，git push 部署后验证浏览器→域名→Zeabur→Funnel→引擎全链路。
+- **Zeabur 前端生产已上线**（2026-09-10 验证）：生产域名 `https://kineto.标智云.中国`（punycode `kineto.xn--9kqt69c97a.xn--fiqs8s`）可访问，全链路 浏览器→域名→Zeabur→Funnel→引擎 已打通（P1.1 推送后实测：drcs 3MB 经代理 3.4-16.6s 返回 200 字节一致，三态渲染正常）。Zeabur 构建约需 10-15 分钟，push 后耐心等待（以 `/draco/draco_decoder.wasm` 返回 200 作为新构建生效探针）。Funnel 带宽波动大（实测 2KB/s-370KB/s），新构建后首次请求可能命中冷路由极慢，重试即恢复。
 - **自定义域名**（可选）：若品牌需要 `kineto.标智云.中国` 而非 `ts.net`，Tailscale 支持给节点配 CNAME（需 Tailscale Pro 或以上）；或保留 cloudflared 备用方案。
 - **备用公网方案**：cloudflared 已装（apt 源保留），如需临时公网 URL：`systemctl enable --now cloudflared-quick`，地址用 `journalctl -u cloudflared-quick | grep trycloudflare` 查（重启会变）。
 - K380 三个蓝牙通道中仅一个绑到本机，其余通道可另连 Mac 等设备。
