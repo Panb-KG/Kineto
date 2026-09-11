@@ -80,7 +80,18 @@
 - **前端** `route.ts`：白名单加 `mesh_track.drcs`；**修 gzip 双解压 bug**——undici fetch 自动解压上游 gzip 但保留 `content-encoding` 头，透传会导致浏览器把明文 JSON 当 gzip 二次解压（JSON 解析失败），HOP_BY_HOP 加剥 `content-encoding`（慢的 Funnel 段仍压缩，仅 Zeabur→浏览器段明文）。
 - **门禁** `check_ssot.py` G14：`_decode_drcs_track()` 解析 KDRC v2 头读 perm（不再依赖面序假设，见坑 #19），gather 回原始序后 `np.einsum` 回归 joints；draco 路径 mesh 帧对照 `keyframes[::stride]`。
 - **真机 E2E PASS**（job `89beefcf...`，466 帧）：drcs 3.07MB、无 f32；G14 设备上 **156 帧全部容差内（mean 0.02mm / max 0.07mm）**；公网 Funnel 实测 JSON gzip 829KB/5.5s、drcs 3.07MB/8.3s（原 f32 需 ~15 分钟）；Next 代理透传 drcs 字节一致；浏览器 E2E 骨架→Mesh→叠加三态全部正常渲染。
-- **注意**：G14 在设备上无法用 `check_ssot.py --pose-data` 直接跑（G12 因缺 kineto-web 提前 `return 3`，G14 根本不执行）——需 `python -c` 导入模块直接调 `check_mesh_joints_alignment(path, engine_dir, Report())`。
+- **注意**：G14 在设备上无法用 `check_ssot.py --pose-data` 直接跑（G12 因缺 kineto-web 提前 `return 3`，G14 根本不执行）——需 `python -c` 导入模块直接调 `check_mesh_joints_alignment(path, engine_dir, Report())`；或用新版脚本 `python /tmp/check_ssot.py --repo-root /opt/kineto --ts /tmp/skeleton.ts --pose-data <job>/pose_data.json`（skeleton.ts rsync 到 /tmp，绕过缺失前端）。
+
+### 2026-09-10 P2.1 肢体端点 2D 锚定校正 + G14 漂移根治（已回退，形体扭曲不可用）
+- **状态：已回退**。三文件（`limb_anchor.py`/`kineto_core.py`/`skeleton_spec.py`）全部撤销到 P1.1 基线（`kineto_core.py`/`skeleton_spec.py` `git checkout`；`limb_anchor.py` untracked 手动删除 P2.1 函数/簿记/射线登记，method 名恢复 `v3e`）。设备已同步重启，回退后基线 job `7e61bd71...` 正常（4dhumans, 0.9936, 90s）。
+- **回退原因**：G14 数值虽优（max 0.06mm），但**目视形体扭曲严重，完全不可用**——「交付模型回归关节」策略把锚定后关节位置替换为 SMPL 模型拟合后的 J_reg 回归关节，肩/肘等关节被拉到模型可达流形上，导致整体姿态变形。量化指标（G14/2D px）无法反映形变问题，目视是唯一可靠判据。
+- **根因分析（保留供后续参考）**：G14 340mm 漂移 = ①锚定各环节（射线球交放宽/直链垂足/叶点 stretch_cap/叶子随动/中值滤波）产生超伸骨（前臂锚定后 583mm vs β 真实 258mm），Phase2 骨长依赖审计按**全片均值**判界 → 局部超伸帧漏检 → 约束整轮不跑；②joints→thetas 反算用 betas=0 均值 rest 模板，个体 β 骨方向差沿链累积（mesh 骨方向角实测仅 1.1-1.7°，漂移纯骨长）。
+- **已尝试的方案（勿原样重复）**：
+  - `limb_anchor.py` 锚定出口 `_restore_bone_lengths()`：逐骨复原为 HMR2 原骨长，射线∩真骨长球面优先、不穿球取球面最近点。骨长 max 0.0mm 精确——但**单独使用不解决 thetas→mesh 漂移**（thetas 仍用均值 rest 反算）。
+  - `skeleton_spec.py` `beta_rest_joints(β)` + `kineto_core.py` 逐帧 β rest 重算 thetas：G14 39→36mm，改善有限。
+  - `kineto_core.py` `refine_thetas_smpl()` 真 SMPL 模型 Adam+LBFGS 精修 + **交付模型回归关节**：G14 0.06mm 但**形体扭曲**——根因是 J_reg 回归关节位置 ≠ 锚定目标位置，替换后关节虽与 mesh 同源，但姿态几何被破坏。
+- **生产坑（保留）**：systemd 子进程无 `SMPL_DATA_DIR`，`_resolve_pkl_path()` 解析到引擎内 vendored `basicModel_*.pkl`（无 smpl/ 子树，smplx 不可用）→ refine 静默兜底。离线验证一直带 env 故未暴露。后续如再用 smplx 需在候选路径显式加 `/srv/kineto/models/4DHumans/data` 或在 systemd env 中设 `SMPL_DATA_DIR`。
+- **教训**：①G14 数值好 ≠ 视觉效果好，坐标/关节替换类改动必须目视确认形体；②「交付关节取模型回归关节」是错误方向——应保持锚定后关节不变，改为修正 thetas/mesh forward 使其拟合关节，而非反过来；③离线验证环境必须与生产 systemd 环境对齐（env 变量）。
 
 ## 3. 核心信息速查（设备与服务）
 
@@ -146,10 +157,17 @@
 19. **DRACO 压缩会重排顶点编号，且解码面序/绕序不可假定与输入一致**：DracoPy/DRACOLoader 按连通性遍历重排顶点（跨帧确定性一致：解码 faces 逐帧完全相同），但「面 i 解码后仍是输入面 i」的假设**实测不成立**（G14 面角对应断言失败）。正确做法（KDRC v2）：编码方持有原始顶点 → 编码后立即解码首帧 → 3D 最近点匹配（量化误差 ≪ 顶点间距，匹配唯一）求 orig→dec 排列 perm，断言双射 + 三角形多重集一致，perm 写入容器头；消费方直接套 perm，零假设。前端面索引仍用 JSON 的 SMPL 标准 `mesh_faces`（perm 还原后顶点序与面表同序）。
 20. **Next.js 代理上游 gzip 的双解压坑**：引擎加 `GZipMiddleware` 后，route handler 里 `fetch()`（undici）自动解压 body 但**响应头保留 `content-encoding: gzip`**；若原样转发响应头，浏览器会把已解压的明文 body 再当 gzip 解压 → JSON parse 失败（curl `--compressed` 表现为 0B）。代理转发响应头必须剥 `content-encoding`（`content-length` 同理已剥）。
 21. **dev 模式 React StrictMode 双挂载产生的 ERR_ABORTED 是噪音**：effect 双跑 → 首轮 AbortController 取消在途请求（视频/mesh/draco worker），控制台见 `ERR_ABORTED`；二轮重试即成功（生产构建无此问题）。判断标准：功能最终是否正常渲染，而非控制台有无 abort。
-22. **设备上跑 G14 不能用 `check_ssot.py --pose-data`**：main() 在 G12 发现缺 `kineto-web/lib/skeleton.ts` 时 `return 3` 提前退出，G14 段根本不执行。设备上单跑 G14：`cd /opt/kineto/kineto-engine && /opt/kineto/venv/bin/python -c "import check_ssot as c; from pathlib import Path; rep=c.Report(); c.check_mesh_joints_alignment(Path('<job>/pose_data.json'), Path('.'), rep); print(len(rep.errors), len(rep.drifts))"`（DracoPy 只装在 venv，Mac 系统 python 无 DracoPy → G14 SKIP）。
+22. **设备上跑 G14 不能用 `check_ssot.py --pose-data`**：main() 在 G12 发现缺 `kineto-web/lib/skeleton.ts` 时 `return 3` 提前退出，G14 段根本不执行。设备上单跑 G14 两种方式：①`cd /opt/kineto/kineto-engine && /opt/kineto/venv/bin/python -c "import check_ssot as c; ..."` 直接调 `check_mesh_joints_alignment`；②新版脚本 rsync 到 /tmp 并补一个前端镜像：`/opt/kineto/venv/bin/python /tmp/check_ssot.py --repo-root /opt/kineto --ts /tmp/skeleton.ts --pose-data <job>/pose_data.json`（DracoPy 只装在 venv，Mac 系统 python 无 DracoPy → G14 SKIP）。注意 `/opt/kineto/deploy/check_ssot.py` 可能是旧版（不读 mesh_track.drcs 会报「无 mesh_vertices → SKIP」），以仓库 `deploy/` 为准 rsync。
+23. **2D 锚定出口必须保骨长，且判界不能用全片均值**：射线球交放宽/直链垂足/叶点 stretch_cap/随动/中值滤波任一环节都会把骨长拉超伸（前臂实测 583mm vs 真值 258mm）；Phase2 骨长审计按全片均值判界会漏检局部超伸帧导致约束整轮不跑。解法：锚定最后单遍树序逐骨复原为**该帧 HMR2 原骨长**（与 β 同源），射线不穿真骨长球时取「球面上离射线最近点」（骨长恒精确优先于 2D 贴合）。配套：joints→thetas 的 rest 模板必须逐帧 `beta_rest_joints(β)`，均值模板沿链累积；纯解析 FK 不含 pose blendshape，需真 SMPL 模型 Adam+L-BFGS 精修。
+24. **J_regressor 回归关节 ≠ FK 关节，「交付模型回归关节」策略已证实失败（P2.1 回退）**：J_reg 是顶点加权平均，肩/肘回归位置会随邻肢旋转偏移，锚定目标在 SMPL 可达流形外 p90 ~15mm。曾尝试把交付 joints_3d 替换为精修模型回归关节 → G14 0.06mm 但**形体扭曲严重不可用**——关节被拉到模型可达流形上，姿态几何被破坏。**教训：G14 数值好 ≠ 视觉效果好，坐标/关节替换类改动必须目视确认形体。正确方向应保持锚定后关节不变，修正 thetas/mesh forward 使其拟合关节，而非反过来用模型关节替换锚定关节。**排查「静默兜底」：api subprocess `capture_output=True` 成功 job 不保留 stdout，只能靠产物指标反推。
+25. **systemd 环境与交互 shell 的模型路径解析不同**：离线验证脚本能跑不代表生产能跑——本次离线一直显式 `SMPL_DATA_DIR=/srv/kineto/models/4DHumans/data`，而 systemd 无此 env，`skeleton_spec._resolve_pkl_path()` 落到引擎内 vendored `4D-Humans/data/basicModel_*.pkl`（smplx 需要 `data/smpl/SMPL_NEUTRAL.pkl` 子树，vendored 布局不适用）。新增依赖外部模型目录的代码必须把设备布局 SSOT（`/srv/kineto/models/...`）写成显式兜底候选，且在 `sudo env -u SMPL_DATA_DIR` 干净环境冒烟验证。
 
 ## 5. 待办 / 后续方向
 
+- **P2.1 已回退**（2026-09-10）：锚定骨长复原 + β-rest 重算 + SMPL 模型精修 + 同源交付关节 → G14 0.06mm 但**形体扭曲不可用**，三文件全部撤销到 P1.1 基线。G14 340mm 漂移问题仍然存在（P1.1 基线状态），需换方向重新设计：保持锚定后关节不变，修正 thetas/mesh forward 拟合关节，而非用模型关节替换。arm 段 2D 残差 p50 ~42px 为几何不可达下限。**任何新方案必须先目视确认形体再上生产。**
+- **P2.2 地面接触约束**（优先级下调，待 P2.1 重新设计后）：撑地手穿插地面 p90≈60mm；ground_y 取膝/踝/脚 y 的 90 分位（手不参与估计），近地且静止的端点（手/脚）clamp 到地平面，修 mesh 穿插。
+- **P2.2 地面诊断完成**（2026-09-11，只读，未改代码）：鸟狗式视频 job `8f16844b...`（885 帧，quality 0.9941）实测确认支撑手「缺腕背伸」——腕弯折角 p50 177°（应 90°）、手叶点俯仰 64-71°（垂直指地）、SMPL 腕局部旋转仅 14.8°。脚踝 bend≈100° 本身正确。诊断脚本 `/tmp/p22_ground_diag.py`（通用只读，传 pose_data 路径即可）。关键发现：地面估计必须按姿态 regime 切换——仰卧用核心段/全身包络（下肢 p90 偏差 +0.3m），四点支撑下肢 p90 即可；触地检测需叶点+腕联合口径（四点支撑时腕离地约一掌厚，单测腕漏检 70%）。
+- **拍摄指导文档**（2026-09-11）：`SHOOTING_GUIDE.md`——基于管线实际参数（focal/256/KP_CONF_MIN/BBOX_SHAPE 等）的教练拍摄规范 + 算法侧优化建议。核心：脊椎平行地面→横屏、垂直→竖屏；半侧位 45° + 贴身纯色衣物 + 赤脚；地面训练竖拍避免旋转欺骗。算法侧 P2.2 方向确认（thetas 层腕背伸叠加，不替换关节位置）。
 - **Zeabur 前端生产已上线**（2026-09-10 验证）：生产域名 `https://kineto.标智云.中国`（punycode `kineto.xn--9kqt69c97a.xn--fiqs8s`）可访问，全链路 浏览器→域名→Zeabur→Funnel→引擎 已打通（P1.1 推送后实测：drcs 3MB 经代理 3.4-16.6s 返回 200 字节一致，三态渲染正常）。Zeabur 构建约需 10-15 分钟，push 后耐心等待（以 `/draco/draco_decoder.wasm` 返回 200 作为新构建生效探针）。Funnel 带宽波动大（实测 2KB/s-370KB/s），新构建后首次请求可能命中冷路由极慢，重试即恢复。
 - **自定义域名**（可选）：若品牌需要 `kineto.标智云.中国` 而非 `ts.net`，Tailscale 支持给节点配 CNAME（需 Tailscale Pro 或以上）；或保留 cloudflared 备用方案。
 - **备用公网方案**：cloudflared 已装（apt 源保留），如需临时公网 URL：`systemctl enable --now cloudflared-quick`，地址用 `journalctl -u cloudflared-quick | grep trycloudflare` 查（重启会变）。
