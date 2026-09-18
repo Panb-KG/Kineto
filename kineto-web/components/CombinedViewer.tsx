@@ -40,6 +40,12 @@ const JOINT_RADIUS = 0.028;
 const JOINT_COLOR = "#2b3a46";
 const BONE_RADIUS = 0.016;
 const HEAD_JOINT_INDEX = 15;
+/**
+ * 叠加态骨架渲染层级：骨架几何位于 mesh 内部，若参与深度测试会被不透明皮肤
+ * 完全遮挡。置顶 renderOrder + 关闭 depthTest/depthWrite，使骨架标点/骨骼
+ * 始终绘制在 mesh 表面（X光叠加层语义）；仅作用于叠加态，纯骨架视图不变。
+ */
+const SKELETON_RENDER_ORDER = 10;
 
 interface CombinedViewerProps {
   keyframes: Keyframe[];
@@ -232,6 +238,7 @@ function SkeletonRig({
             jointRefs.current[i] = el as THREE.Mesh | null;
           }}
           castShadow
+          renderOrder={SKELETON_RENDER_ORDER}
         >
           <sphereGeometry
             args={[i === HEAD_JOINT_INDEX ? JOINT_RADIUS * 1.5 : JOINT_RADIUS, 20, 20]}
@@ -240,6 +247,8 @@ function SkeletonRig({
             color={JOINT_COLOR}
             roughness={0.35}
             metalness={0.05}
+            depthTest={false}
+            depthWrite={false}
           />
         </mesh>
       ))}
@@ -251,12 +260,15 @@ function SkeletonRig({
             boneRefs.current[i] = el as THREE.Mesh | null;
           }}
           castShadow
+          renderOrder={SKELETON_RENDER_ORDER}
         >
           <cylinderGeometry args={[BONE_RADIUS, BONE_RADIUS, 1, 12, 1, false]} />
           <meshStandardMaterial
             color={boneColor(a, b)}
             roughness={0.45}
             metalness={0.08}
+            depthTest={false}
+            depthWrite={false}
           />
         </mesh>
       ))}
