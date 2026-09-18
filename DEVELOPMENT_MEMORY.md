@@ -93,6 +93,21 @@
 - **生产坑（保留）**：systemd 子进程无 `SMPL_DATA_DIR`，`_resolve_pkl_path()` 解析到引擎内 vendored `basicModel_*.pkl`（无 smpl/ 子树，smplx 不可用）→ refine 静默兜底。离线验证一直带 env 故未暴露。后续如再用 smplx 需在候选路径显式加 `/srv/kineto/models/4DHumans/data` 或在 systemd env 中设 `SMPL_DATA_DIR`。
 - **教训**：①G14 数值好 ≠ 视觉效果好，坐标/关节替换类改动必须目视确认形体；②「交付关节取模型回归关节」是错误方向——应保持锚定后关节不变，改为修正 thetas/mesh forward 使其拟合关节，而非反过来；③离线验证环境必须与生产 systemd 环境对齐（env 变量）。
 
+### 2026-09-11~18 P2.2 四点支撑腕背伸修正（已上线）
+- **问题**：HMR2 对四点支撑/鸟狗式撑地手臂普遍缺失腕背伸——腕弯折角（肘-腕-手夹角）p50=177°（直腕），SMPL mitten 手掌垂直戳穿地面；解剖学上应背伸约 90° 平放贴地。脚踝 bend≈100° 本身正确，不动。
+- **方案（与 P2.1 本质不同）**：新建 `kineto-engine/wrist_ground_fix.py`，在 Phase3 thetas 合并后、keyframe 写入前批量修正。
+  - **触地检测**：clip 级地面（全身关节包络 p95）+ 前方向（脊柱水平投影中位数）；三门合取（腕离地<0.20m 且叶点离地<0.08m 且叶点画面平面速度<0.15m/s）；连续≥5帧成段、短间隙≤12帧桥接、段端5帧线性 fade、窗5滑动平均。速度只取 x-y 分量（cam_t.z 深度抖动 p90≈0.5m，三维速度会误判静止手）。几何判定用窗9中值平滑 cam_t（仅判定不改交付）。
+  - **修正量**：世界系 Rodrigues 最小旋转把手骨向量旋到「前方向在小臂法平面上的投影」（与小臂精确成90°且朝前，退化回退纯 fwd），经 FK 世界旋转映射为腕关节 j20/j21 的**局部**增量，按触地权重 slerp。
+  - **只改腕 thetas**：不动 global_orient、不动其他关节。修后逐帧 SMPL forward（与 `compute_mesh_for_keyframes` 同路径：bs=1/pose2rot=False/J_reg），pelvis 锚定后**全 24 关节写回**——因 SMPL LBS 蒙皮使腕旋转经皮肤顶点波及对侧手关节（~1-2mm），只写回支撑手会导致未支撑侧与 mesh 不一致、G14 出 ~2mm 偏差；全量写回后 joints↔thetas↔mesh 完全同源。
+- **量化验证（鸟狗 885 帧）**：bend p50 L 176.9°→91.0° / R 177.1°→90.9°；非腕 thetas 逐位零变化；非支撑帧 thetas 零变化；非目标关节蒙皮波及 ≤2.7mm；G14 模拟全 24 关节 0.0002mm。
+- **真机验收**：`wrist_ground_fix.py` + `kineto_core.py` 三处接入（import/Phase3调用/metadata `wrist_dorsiflexion` 溯源）。生产 job：G14 mean 0.02mm/max 0.06mm；`validate.sh --mofang-mode stripped` G1-G10/G13 全 PASS；前端 E2E 目视双掌平放贴地、鸟狗悬空手保持原样、无逐帧跳变。
+- **回退锚点**：Mac tag `pre-p2.2-wrist`→`dab26d7`；设备 `/srv/kineto/backup/kineto_core.py.baseline`。
+
+### 2026-09-18 设备网络排查
+- **现象**：Mac → tailnet `100.101.114.50` 100% 丢包，`tailscale status` 报 `Failed to save preferences`，路由误走默认网关。
+- **根因**：Mac 端 Tailscale GUI 进程在跑但隧道断开（无 utun 100.x 地址、MagicDNS 失效）。
+- **修复**：`osascript -e 'quit app "Tailscale"'` 退出后 `open -a Tailscale` 重新打开，~5s 后 utun11 拿到 100.73.220.80，隧道恢复。与设备侧无关（设备 Tailscale 正常）。
+
 ## 3. 核心信息速查（设备与服务）
 
 ### 访问方式

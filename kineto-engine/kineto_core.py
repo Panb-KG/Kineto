@@ -33,6 +33,8 @@ from skeleton_spec import (
     SMPL_REST_JOINTS,
     SMPL_SKELETON,
 )
+# [P2.2] 四点支撑触地腕背伸后处理（仅改腕 thetas 并同源更新腕/手关节）
+from wrist_ground_fix import apply_wrist_dorsiflexion
 
 
 # ============================================================================
@@ -1885,6 +1887,37 @@ def _process_video_impl(stack, input_path, output_dir, device,
     else:
         print("[Phase 3] 沿用 HMR2 原始 thetas（no_refine 或帧数不匹配）(#P2-C)")
 
+    # [P2.2] 四点支撑触地腕背伸修正：HMR2 撑地手普遍直腕（bend≈177°）手掌
+    # 戳地，解剖学上应背伸约 90° 平放贴地。仅在 4dhumans 真姿态上执行：
+    # 批量触地检测 → 只改腕 j20/j21 的 rotvec（slerp 权重）→ 修后 SMPL forward
+    # 同源更新腕/手叶关节（保 joints↔thetas 契约与 G14）；非目标关节实测
+    # 位移 ≤2.7mm，脚踝/非支撑帧不受影响。失败时安全降级为不修正（等价关闭）。
+    wrist_fix_info = {"applied": False}
+    if extractor.mode == "4dhumans" and getattr(extractor, "model", None) is not None \
+            and hasattr(extractor.model, "smpl"):
+        try:
+            betas_arr = np.asarray(
+                [b if b is not None else [0.0] * 10 for b in betas_list],
+                dtype=np.float32)
+            if betas_arr.shape[0] != n_frames_out:
+                betas_arr = np.zeros((n_frames_out, 10), dtype=np.float32)
+            thetas_arr, final_joints, wrist_fix_info = apply_wrist_dorsiflexion(
+                thetas_arr, final_joints, cam_t_arr, fps, betas_arr,
+                extractor.model.smpl, device)
+            if wrist_fix_info["applied"]:
+                for _tag, _h in wrist_fix_info["hands"].items():
+                    if _h["support_frames"]:
+                        print(f"[P2.2] {_tag}手支撑 {_h['support_frames']}/{n_frames_out} "
+                              f"帧，bend {_h['bend_before_median_deg']}°→"
+                              f"{_h['bend_after_median_deg']}°")
+            else:
+                print("[P2.2] 未检测到触地支撑段，腕部不修正")
+        except Exception as exc:
+            wrist_fix_info = {"applied": False, "error": repr(exc)}
+            print(f"[P2.2] ⚠️  腕背伸修正失败，安全降级为不修正: {exc}", file=sys.stderr)
+    else:
+        print("[P2.2] 非 4dhumans 模式，跳过腕背伸修正")
+
     renderer = SkeletonRenderer(width, height, focal_length=extractor.focal_length,
                                 image_size=extractor.image_size)
     # [Fix #61] 视频编码改为 web 兼容：mp4v (MPEG-4 Part 2) 不被现代浏览器支持，
@@ -2024,6 +2057,9 @@ def _process_video_impl(stack, input_path, output_dir, device,
         "model_version": "4dhumans-v1.0" if extractor.mode == "4dhumans" else "fallback-v1.0",
         "device": str(device),
         "extraction_mode": extractor.mode,
+        # [P2.2] additive 溯源：四点支撑触地腕背伸后处理记录（applied/每手支撑
+        # 帧数/bend 前后/检测参数）。未触发时 applied=false；消费方按 applied 判定。
+        "wrist_dorsiflexion": wrist_fix_info,
         # [M3] additive 判别位（前端/deploy 按此消费，确切值不可改）：
         #   joint_order="smpl-canonical"：joints_3d/thetas 均为 SMPL canonical 24 序
         #     （P1 归一后；旧产物 joints_3d 曾为 OpenPose Body-25 序）。
