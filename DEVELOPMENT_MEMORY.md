@@ -121,6 +121,12 @@
 - 引擎所有受保护端点需请求头 `X-API-Key`（值在设备 `/etc/kineto/kineto-engine.env`，勿入库入文档）。
 - 大视频（>100MB 或经公网隧道）先 `scp` 到设备 `/srv/kineto/inbox/`，再 POST `{"video_path":"/srv/kineto/inbox/xx.mp4"}`。
 
+### Mac→设备 Tailscale 排障速查（2026-09-19 定论）
+- **TRAE 沙箱假阳性**：TRAE 终端内跑 `tailscale status`/`version` 报 `CLI credentials are not available BadResponse` 是沙箱拦截 sameuserproof 本地凭据交换所致，**不代表 Tailscale 故障**。需用 CLI 时走原生终端：`osascript -e 'tell application "Terminal" to do script "/usr/local/bin/tailscale status > /tmp/ts.txt 2>&1"'` 后读文件；或直接用 API 探针（TRAE 内可用）：`PROOF=$(cat /Library/Tailscale/sameuserproof-$(readlink /Library/Tailscale/ipnport)); curl -s -u "$(whoami):$PROOF" http://127.0.0.1:$(readlink /Library/Tailscale/ipnport)/localapi/v0/status`（看 `BackendState=Running`、`TailscaleIPs`）。
+- **数据面真断判据**：`ifconfig | grep 'inet 100'` 无 utun 100.x 地址、`route -n get 100.101.114.50` 走默认网关 en0 而非 utun、ping 100% 丢包。
+- **真断恢复手法**：`osascript -e 'quit app "Tailscale"'` 后 `open -a Tailscale`，等 ~5-10s，utun 重新拿到 100.73.220.80 即恢复（数据面由 Network Extension 承载，重启 app 会连带重建隧道）。
+- **断连根因**：合盖/睡眠后 Network Extension 偶发不自动重连（电源策略：电池 `sleep 1`/`networkoversleep 0`，交流 `sleep 0` 但合盖仍 Clamshell Sleep）。插电且不合盖可规避；属 Apple NE 睡眠唤醒已知不稳定性，非设备侧问题。
+
 ### 服务布局（设备侧）
 | 项 | 路径 |
 |---|---|
